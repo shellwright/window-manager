@@ -1,0 +1,26 @@
+[package]
+name        = "shellwright"
+description = "Cross-platform tiling window manager"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "window-manager"
+path = "src/main.rs"
+
+[dependencies]
+shellwright-core.path           = "../shellwright-core"
+anyhow.workspace       = true
+tracing.workspace      = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+shellwright-windows.path = "../shellwright-windows"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+shellwright-macos.path = "../shellwright-macos"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+shellwright-wayland.path = "../shellwright-wayland"

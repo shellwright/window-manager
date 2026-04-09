@@ -1,0 +1,39 @@
+# Build output
+/target/
+
+# Cargo lock kept for binaries (remove this line if you want to ignore it)
+# Cargo.lock
+.claude/
+
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Profiling / coverage
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# cargo-deny / audit artefacts
+deny.lock

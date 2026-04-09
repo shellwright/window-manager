@@ -1,0 +1,24 @@
+[package]
+name        = "shellwright-wayland"
+description = "Wayland compositor backend built on Smithay"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+shellwright-core.path        = "../shellwright-core"
+thiserror.workspace = true
+tracing.workspace   = true
+
+# Smithay + calloop — Linux only.
+# Unlike the other two backends, this crate *is* the compositor, not a client.
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay = { version = "0.3", default-features = false, features = [
+    "backend_drm",
+    "backend_libinput",
+    "backend_udev",
+    "wayland_frontend",
+    "desktop",
+] }
+calloop = "0.13"

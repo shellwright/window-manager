@@ -1,0 +1,9 @@
+# Reproducible-build flags.
+# Stripping absolute source paths aids SLSA provenance (https://slsa.dev/spec/).
+[build]
+rustflags = ["--remap-path-prefix", "="]
+
+# Faster linker on Linux (install lld: `apt install lld` / `dnf install lld`).
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

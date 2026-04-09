@@ -1,0 +1,18 @@
+[package]
+name        = "shellwright-macos"
+description = "macOS Accessibility API backend"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+shellwright-core.path        = "../shellwright-core"
+thiserror.workspace = true
+tracing.workspace   = true
+
+# Accessibility + CoreFoundation bindings — macOS only.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation  = "0.10"
+core-graphics    = "0.23"
+accessibility    = "0.1"

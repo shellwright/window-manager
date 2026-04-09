@@ -1,0 +1,22 @@
+[package]
+name        = "shellwright-windows"
+description = "Win32 backend — manages windows via SetWindowPos / SetWinEventHook"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+shellwright-core.path        = "../shellwright-core"
+thiserror.workspace = true
+tracing.workspace   = true
+
+# windows-rs is only compiled on Windows; no-op on other hosts.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+] }

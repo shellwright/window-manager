@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shellwright-core",
+    "crates/shellwright-windows",
+    "crates/shellwright-macos",
+    "crates/shellwright-wayland",
+    "crates/shellwright",
+]
+
+# ── Shared package metadata ────────────────────────────────────────────────────
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "GNU GPL v3"
+authors      = ["Hylke Hellinga"]
+
+# ── Shared dependencies (all crates pin the same version) ─────────────────────
+[workspace.dependencies]
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Observability — tracing crate is OpenTelemetry-compatible (OTLP exporters available).
+# Satisfies CNCF OpenTelemetry spec: https://opentelemetry.io/docs/specs/
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config / serialisation
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+
+# Bitfield flags (Modifiers bitmask in shellwright-core)
+bitflags = { version = "2", features = ["serde"] }
+
+# ── Release profile ────────────────────────────────────────────────────────────
+# LTO + single codegen-unit → smaller, faster binary for a system daemon.
+[profile.release]
+lto            = true
+codegen-units  = 1
+strip          = "symbols"
