@@ -152,8 +152,7 @@ fn event_loop<B: Backend>(
                     find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
                 {
                     focused_mon = mon;
-                    workspaces[ws_idx].focused = Some(id);
-                    update_borders(&mut backend, &workspaces[ws_idx], &config);
+                    set_global_focus(id, ws_idx, &mut backend, &mut workspaces, &monitor_ws, &config);
                 }
             }
 
@@ -339,6 +338,26 @@ fn ws_monitor_rect(ws_idx: usize, ws_per_mon: usize, monitor_rects: &[Rect]) -> 
 
 // ── Border helpers ────────────────────────────────────────────────────────────
 
+/// Set `id` as the one focused window globally:
+/// - Clears `focused` on every other currently-visible workspace so only one
+///   window across all monitors ever shows the active border colour.
+/// - Repaints borders for every visible workspace in one pass.
+fn set_global_focus<B: Backend>(
+    id: WindowId,
+    focused_ws: usize,
+    backend: &mut B,
+    workspaces: &mut Vec<Workspace>,
+    monitor_ws: &[usize],
+    config: &Config,
+) {
+    for &ws_idx in monitor_ws {
+        workspaces[ws_idx].focused = if ws_idx == focused_ws { Some(id) } else { None };
+    }
+    for &ws_idx in monitor_ws {
+        update_borders(backend, &workspaces[ws_idx], config);
+    }
+}
+
 fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Config) {
     let active_color   = parse_hex_color(&config.border_active);
     let inactive_color = parse_hex_color(&config.border_inactive);
@@ -493,15 +512,12 @@ fn dispatch<B: Backend>(
                 .unwrap_or(0);
             let (next_id, next_mon) = candidates[(pos + 1) % candidates.len()];
             let next_ws = monitor_ws[next_mon];
-            workspaces[next_ws].focused = Some(next_id);
             *focused_mon = next_mon;
+            set_global_focus(next_id, next_ws, backend, workspaces, monitor_ws, config);
             if let Some(w) = backend.window_mut(next_id) {
                 if let Err(e) = w.focus() {
                     tracing::warn!(id = %next_id, err = %e, "focus failed");
                 }
-            }
-            for m in 0..n_mons {
-                update_borders(backend, &workspaces[monitor_ws[m]], config);
             }
         }
 
@@ -526,23 +542,28 @@ fn dispatch<B: Backend>(
             let prev = if pos == 0 { candidates.len() - 1 } else { pos - 1 };
             let (prev_id, prev_mon) = candidates[prev];
             let prev_ws = monitor_ws[prev_mon];
-            workspaces[prev_ws].focused = Some(prev_id);
             *focused_mon = prev_mon;
+            set_global_focus(prev_id, prev_ws, backend, workspaces, monitor_ws, config);
             if let Some(w) = backend.window_mut(prev_id) {
                 if let Err(e) = w.focus() {
                     tracing::warn!(id = %prev_id, err = %e, "focus failed");
                 }
-            }
-            for m in 0..n_mons {
-                update_borders(backend, &workspaces[monitor_ws[m]], config);
             }
         }
 
         // ── Window manipulation ───────────────────────────────────────────────
         Action::MoveNext => {
             if let Some(focused) = workspaces[cur_ws].focused {
-                let len = workspaces[cur_ws].windows().len();
-                let pos = workspaces[cur_ws].windows().iter().position(|&w| w == focused);
+                // Only count non-minimised windows for position and edge detection.
+                // Minimised windows are invisible to the user and should be skipped.
+                let active: Vec<WindowId> = workspaces[cur_ws]
+                    .windows()
+                    .iter()
+                    .copied()
+                    .filter(|&id| !backend.window_mut(id).map_or(false, |w| w.is_minimized()))
+                    .collect();
+                let len = active.len();
+                let pos = active.iter().position(|&w| w == focused);
                 if let Some(pos) = pos {
                     let at_edge = pos + 1 >= len;
                     let right_mon = *focused_mon + 1;
@@ -550,23 +571,26 @@ fn dispatch<B: Backend>(
                         // Cross to right monitor's active workspace.
                         let target_ws = monitor_ws[right_mon];
                         workspaces[cur_ws].remove_window(focused);
-                        // Append to end so window sits at the right edge of the new
-                        // workspace — next MoveNext crosses immediately (one press
-                        // per monitor boundary).
-                        workspaces[target_ws].windows_mut().push(focused);
-                        workspaces[target_ws].focused = Some(focused);
+                        // Insert at front: entering from the left side of the right workspace.
+                        workspaces[target_ws].windows_mut().insert(0, focused);
                         *focused_mon = right_mon;
                         tracing::info!(%focused, to_ws = %workspaces[target_ws].name, "MoveNext: crossed to right monitor");
-                        let src_rect = monitor_rects.get(*focused_mon - 1).copied().unwrap_or(cur_mon_rect);
+                        let src_rect = monitor_rects.get(right_mon - 1).copied().unwrap_or(cur_mon_rect);
                         apply_layout(backend, &workspaces[cur_ws], src_rect, config);
-                        update_borders(backend, &workspaces[cur_ws], config);
                         let tgt_rect = monitor_rects.get(right_mon).copied().unwrap_or(cur_mon_rect);
                         apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
-                        update_borders(backend, &workspaces[target_ws], config);
+                        set_global_focus(focused, target_ws, backend, workspaces, monitor_ws, config);
                         if let Some(w) = backend.window_mut(focused) { let _ = w.focus(); }
                     } else {
-                        let next = (pos + 1) % len;
-                        workspaces[cur_ws].windows_mut().swap(pos, next);
+                        // Swap with the next non-minimised window using full-list indices.
+                        let next_id = active[(pos + 1) % len];
+                        let windows = workspaces[cur_ws].windows_mut();
+                        if let (Some(a), Some(b)) = (
+                            windows.iter().position(|&w| w == focused),
+                            windows.iter().position(|&w| w == next_id),
+                        ) {
+                            windows.swap(a, b);
+                        }
                         apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
                         update_borders(backend, &workspaces[cur_ws], config);
                     }
@@ -576,8 +600,15 @@ fn dispatch<B: Backend>(
 
         Action::MovePrev => {
             if let Some(focused) = workspaces[cur_ws].focused {
-                let len = workspaces[cur_ws].windows().len();
-                let pos = workspaces[cur_ws].windows().iter().position(|&w| w == focused);
+                // Only count non-minimised windows for position and edge detection.
+                let active: Vec<WindowId> = workspaces[cur_ws]
+                    .windows()
+                    .iter()
+                    .copied()
+                    .filter(|&id| !backend.window_mut(id).map_or(false, |w| w.is_minimized()))
+                    .collect();
+                let len = active.len();
+                let pos = active.iter().position(|&w| w == focused);
                 if let Some(pos) = pos {
                     let at_edge = pos == 0;
                     let left_mon = focused_mon.checked_sub(1);
@@ -585,23 +616,26 @@ fn dispatch<B: Backend>(
                         let left_mon = left_mon.unwrap();
                         let target_ws = monitor_ws[left_mon];
                         workspaces[cur_ws].remove_window(focused);
-                        // Insert at front so window sits at the left edge of the new
-                        // workspace — next MovePrev crosses immediately (one press
-                        // per monitor boundary).
-                        workspaces[target_ws].windows_mut().insert(0, focused);
-                        workspaces[target_ws].focused = Some(focused);
+                        // Push to end: entering from the right side of the left workspace.
+                        workspaces[target_ws].windows_mut().push(focused);
                         *focused_mon = left_mon;
                         tracing::info!(%focused, to_ws = %workspaces[target_ws].name, "MovePrev: crossed to left monitor");
                         let src_rect = monitor_rects.get(left_mon + 1).copied().unwrap_or(cur_mon_rect);
                         apply_layout(backend, &workspaces[cur_ws], src_rect, config);
-                        update_borders(backend, &workspaces[cur_ws], config);
                         let tgt_rect = monitor_rects.get(left_mon).copied().unwrap_or(cur_mon_rect);
                         apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
-                        update_borders(backend, &workspaces[target_ws], config);
+                        set_global_focus(focused, target_ws, backend, workspaces, monitor_ws, config);
                         if let Some(w) = backend.window_mut(focused) { let _ = w.focus(); }
                     } else {
-                        let prev = if pos == 0 { len - 1 } else { pos - 1 };
-                        workspaces[cur_ws].windows_mut().swap(pos, prev);
+                        // Swap with the previous non-minimised window using full-list indices.
+                        let prev_id = active[if pos == 0 { len - 1 } else { pos - 1 }];
+                        let windows = workspaces[cur_ws].windows_mut();
+                        if let (Some(a), Some(b)) = (
+                            windows.iter().position(|&w| w == focused),
+                            windows.iter().position(|&w| w == prev_id),
+                        ) {
+                            windows.swap(a, b);
+                        }
                         apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
                         update_borders(backend, &workspaces[cur_ws], config);
                     }
@@ -726,6 +760,7 @@ fn dispatch<B: Backend>(
             }
             if let Some(id) = workspaces[idx].focused {
                 tracing::debug!(%id, "focusing first window on new workspace");
+                set_global_focus(id, idx, backend, workspaces, monitor_ws, config);
                 if let Some(w) = backend.window_mut(id) {
                     let _ = w.focus();
                 }
