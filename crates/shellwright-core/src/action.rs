@@ -84,6 +84,7 @@ impl FromStr for Action {
             ["reload_config"]               => Ok(Action::ReloadConfig),
             ["quit"]                        => Ok(Action::Quit),
 
+            ["set_layout", "fibonacci"]     => Ok(Action::SetLayout(LayoutKind::Fibonacci)),
             ["set_layout", "bsp"]           => Ok(Action::SetLayout(LayoutKind::Bsp)),
             ["set_layout", "monocle"]       => Ok(Action::SetLayout(LayoutKind::Monocle)),
             ["set_layout", "float"]         => Ok(Action::SetLayout(LayoutKind::Float)),

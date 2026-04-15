@@ -48,7 +48,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             gap: 8,
-            border_width: 2,
+            border_width: 4,
             border_active:   "#5E81AC".into(), // Nord blue
             border_inactive: "#3B4252".into(), // Nord dark
             padding: Padding::default(),
@@ -83,6 +83,7 @@ fn default_keybindings() -> Vec<Keybinding> {
         kb(&["alt"],          "f",     "toggle_fullscreen"),
         kb(&["alt", "shift"], "space", "toggle_float"),
         // Layouts
+        kb(&["alt"], "g", "set_layout:fibonacci"),
         kb(&["alt"], "t", "set_layout:bsp"),
         kb(&["alt"], "m", "set_layout:monocle"),
         kb(&["alt"], "c", "set_layout:columns:2"),
@@ -152,8 +153,8 @@ mod tests {
     }
 
     #[test]
-    fn default_layout_is_bsp() {
-        assert_eq!(Config::default().default_layout, LayoutKind::Bsp);
+    fn default_layout_is_fibonacci() {
+        assert_eq!(Config::default().default_layout, LayoutKind::Fibonacci);
     }
 
     #[test]

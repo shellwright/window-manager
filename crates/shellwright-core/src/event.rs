@@ -18,8 +18,13 @@ pub enum Event {
     WindowDestroyed(WindowId),
     /// A window has been given input focus.
     WindowFocused(WindowId),
-    /// A floating window was moved/resized by the user.
+    /// A window was moved or resized by the user (drag / manual resize).
     WindowMoved { id: WindowId },
+    /// A window was minimised or restored from minimised state.
+    ///
+    /// Either transition triggers a full relayout so other tiles can
+    /// expand into / contract out of the freed slot.
+    WindowMinimizeChanged { id: WindowId },
     /// A user-configured keybinding fired.
     Keybinding(KeybindingId),
     /// A clean-shutdown request (signal, IPC command, etc.).

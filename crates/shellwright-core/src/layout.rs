@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutKind {
-    /// Binary space partition — recursively halves the screen. Default.
+    /// Fibonacci dwindle spiral — window 0 takes the first half, the rest recurse
+    /// into the remaining half, alternating horizontal/vertical splits. Default.
     #[default]
+    Fibonacci,
+    /// Binary space partition — recursively halves the screen.
     Bsp,
     /// Fixed number of equal-width columns.
     Columns { count: u8 },
@@ -34,20 +37,66 @@ pub struct Slot {
 /// (e.g. [`LayoutKind::Float`]).
 pub fn compute(kind: &LayoutKind, screen: Rect, count: usize) -> Vec<Slot> {
     match kind {
-        LayoutKind::Bsp => bsp(screen, count),
-        LayoutKind::Columns { count: cols } => columns(screen, count, *cols as usize),
-        LayoutKind::Monocle => (0..count.min(1)).map(|_| Slot { rect: screen }).collect(),
-        LayoutKind::Float => vec![],
+        LayoutKind::Fibonacci            => fibonacci(screen, count),
+        LayoutKind::Bsp                  => bsp(screen, count),
+        LayoutKind::Columns { count: c } => columns(screen, count, *c as usize),
+        LayoutKind::Monocle              => (0..count.min(1)).map(|_| Slot { rect: screen }).collect(),
+        LayoutKind::Float                => vec![],
     }
 }
 
+// ── Fibonacci dwindle ─────────────────────────────────────────────────────────
+
+/// Fibonacci / dwindle spiral layout.
+///
+/// Window 0 occupies the "head" half of the screen.  The remaining windows
+/// recurse into the "tail" half, alternating between horizontal and vertical
+/// splits at each level.
+///
+/// ```text
+/// 1 window :  [ 1 ]
+/// 2 windows:  [ 1 | 2 ]           (H-split)
+/// 3 windows:  [ 1 | 2 ]           (1 = left half, 2/3 split V in right half)
+///                  ---
+///                  [ 3 ]
+/// 4 windows:  similar, spiralling inward
+/// ```
+fn fibonacci(screen: Rect, count: usize) -> Vec<Slot> {
+    if count == 0 { return vec![]; }
+
+    let mut slots  = Vec::with_capacity(count);
+    let mut area   = screen;
+    let mut split_h = true; // start with a left/right (horizontal axis) split
+
+    for i in 0..count {
+        if i == count - 1 {
+            // Last window fills whatever space remains.
+            slots.push(Slot { rect: area });
+        } else if split_h {
+            let half = area.width / 2;
+            slots.push(Slot {
+                rect: Rect::new(area.x, area.y, half, area.height),
+            });
+            area = Rect::new(area.x + half as i32, area.y, area.width - half, area.height);
+            split_h = false;
+        } else {
+            let half = area.height / 2;
+            slots.push(Slot {
+                rect: Rect::new(area.x, area.y, area.width, half),
+            });
+            area = Rect::new(area.x, area.y + half as i32, area.width, area.height - half);
+            split_h = true;
+        }
+    }
+
+    slots
+}
+
+// ── BSP ───────────────────────────────────────────────────────────────────────
+
 fn bsp(screen: Rect, count: usize) -> Vec<Slot> {
-    if count == 0 {
-        return vec![];
-    }
-    if count == 1 {
-        return vec![Slot { rect: screen }];
-    }
+    if count == 0 { return vec![]; }
+    if count == 1 { return vec![Slot { rect: screen }]; }
     let split_h = screen.width >= screen.height;
     let (a, b) = if split_h {
         let half = screen.width / 2;
@@ -68,10 +117,10 @@ fn bsp(screen: Rect, count: usize) -> Vec<Slot> {
     slots
 }
 
+// ── Columns ───────────────────────────────────────────────────────────────────
+
 fn columns(screen: Rect, count: usize, cols: usize) -> Vec<Slot> {
-    if count == 0 || cols == 0 {
-        return vec![];
-    }
+    if count == 0 || cols == 0 { return vec![]; }
     let col_w = screen.width / cols as u32;
     (0..count)
         .map(|i| Slot {
@@ -91,8 +140,25 @@ fn columns(screen: Rect, count: usize, cols: usize) -> Vec<Slot> {
 mod tests {
     use super::*;
 
-    fn screen() -> Rect {
-        Rect::new(0, 0, 1920, 1080)
+    fn screen() -> Rect { Rect::new(0, 0, 1920, 1080) }
+
+    #[test]
+    fn fibonacci_one_window_fills_screen() {
+        let s = compute(&LayoutKind::Fibonacci, screen(), 1);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].rect, screen());
+    }
+
+    #[test]
+    fn fibonacci_two_windows_cover_width() {
+        let s = compute(&LayoutKind::Fibonacci, screen(), 2);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].rect.width + s[1].rect.width, 1920);
+    }
+
+    #[test]
+    fn fibonacci_zero_windows() {
+        assert!(compute(&LayoutKind::Fibonacci, screen(), 0).is_empty());
     }
 
     #[test]

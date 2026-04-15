@@ -3,18 +3,21 @@
 //! # Strategy
 //! Acts as a *client* on top of Explorer / DWM — no shell-chrome changes.
 //! Geometry via `SetWindowPos`; focus via `SetForegroundWindow`; close via
-//! `PostMessage(WM_CLOSE)`; borders via `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`.
+//! `PostMessage(WM_CLOSE)`; borders via GDI overlay ring windows.
 //!
 //! # Runtime event tracking
 //! `SetWinEventHook` (OUTOFCONTEXT) posts `WM_SWE` thread messages back to the
 //! main message loop so window create / destroy / focus / move events are detected
 //! without polling.
 //!
-//! # Border colours
-//! `DWMWA_BORDER_COLOR` (attribute 34) is available on Windows 11 22H2+.
-//! On Windows 10 the call silently fails — no error is surfaced.
+//! # Border overlays
+//! Each managed window gets a companion `WS_POPUP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+//! WS_EX_NOACTIVATE` window whose visible region is a hollow ring (outer rect minus inner
+//! rect via `CombineRgn(RGN_DIFF)`).  `WM_NCHITTEST` returns `HTTRANSPARENT` so all
+//! pointer events pass through.  Works on Windows 10 and Windows 11, unlike
+//! `DWMWA_BORDER_COLOR` which is Win11-only.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use shellwright_core::{
     backend::Backend,
@@ -30,29 +33,200 @@ use crate::hotkeys::HotkeyManager;
 // ── WinEvent thread-message plumbing ─────────────────────────────────────────
 
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+/// Atom returned by `RegisterClassExW` for the border overlay window class.
+static BORDER_CLASS_ATOM: AtomicU16 = AtomicU16::new(0);
 
 const WM_SWE: u32 = 0x0401; // WM_USER + 1
 
-const SWE_CREATED:       usize = 1;
-const SWE_DESTROYED:     usize = 2;
-const SWE_FOCUSED:       usize = 3;
-const SWE_MOVESIZEEND:   usize = 4; // EVENT_SYSTEM_MOVESIZEEND — drag/resize finished
+const SWE_CREATED:          usize = 1;
+const SWE_DESTROYED:        usize = 2;
+const SWE_FOCUSED:          usize = 3;
+const SWE_MOVESIZEEND:      usize = 4;
+const SWE_MINIMIZE_CHANGE:  usize = 5; // MINIMIZESTART or MINIMIZEEND
+
+// ── Border overlay WndProc ────────────────────────────────────────────────────
+
+/// Window procedure for border overlay windows.
+///
+/// Fills the entire client area with the colour stored in `GWLP_USERDATA`
+/// (as a Win32 `COLORREF`).  The window's region is always a hollow ring, so
+/// the painted area is visually the ring only.
+///
+/// `WM_NCHITTEST` returns `HTTRANSPARENT` (-1) so all pointer events fall
+/// through to whatever window is below.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn border_wnd_proc(
+    hwnd:   windows::Win32::Foundation::HWND,
+    msg:    u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{COLORREF, LRESULT};
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
+        HGDIOBJ, PAINTSTRUCT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, GetWindowLongPtrW, GWLP_USERDATA, WM_NCHITTEST, WM_PAINT,
+    };
+
+    match msg {
+        WM_PAINT => {
+            let colorref = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32;
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let brush = CreateSolidBrush(COLORREF(colorref));
+            FillRect(hdc, &ps.rcPaint, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        // HTTRANSPARENT = -1: pass all hit-tests through to the window below.
+        WM_NCHITTEST => LRESULT(-1),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Register the `shellwright_border` window class; returns the atom (0 on failure).
+#[cfg(target_os = "windows")]
+unsafe fn register_border_class() -> u16 {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        RegisterClassExW, CS_HREDRAW, CS_VREDRAW, WNDCLASSEXW,
+    };
+    use windows::core::PCWSTR;
+
+    let hmodule = GetModuleHandleW(None).unwrap_or_default();
+    let hinstance = HINSTANCE(hmodule.0);
+    let class_name: Vec<u16> = "shellwright_border\0".encode_utf16().collect();
+
+    let wc = WNDCLASSEXW {
+        cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style:         CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc:   Some(border_wnd_proc),
+        hInstance:     hinstance,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+
+    RegisterClassExW(&wc)
+}
+
+/// Create a border overlay window positioned over `rect`.  Returns the raw
+/// HWND as `isize`, or 0 on failure.
+#[cfg(target_os = "windows")]
+unsafe fn create_overlay(rect: Rect) -> isize {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, WS_POPUP,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    };
+    use windows::core::PCWSTR;
+
+    let atom = BORDER_CLASS_ATOM.load(Ordering::Relaxed);
+    if atom == 0 { return 0; }
+
+    let hmodule = GetModuleHandleW(None).unwrap_or_default();
+    let hinstance = HINSTANCE(hmodule.0);
+
+    // MAKEINTATOM equivalent: cast atom to *const u16
+    let class_ptr = PCWSTR(atom as usize as *const u16);
+
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        class_ptr,
+        PCWSTR::null(),
+        WS_POPUP,
+        rect.x,
+        rect.y,
+        rect.width as i32,
+        rect.height as i32,
+        None,
+        None,
+        hinstance,
+        None,
+    );
+
+    match hwnd {
+        Ok(h) if !h.0.is_null() => h.0 as isize,
+        _ => 0,
+    }
+}
+
+/// Reposition the overlay and rebuild its hollow ring region.
+///
+/// The ring region is: full window rect **minus** the inner rect inset by
+/// `border_width` on all sides.  After `SetWindowRgn` the OS owns `outer`;
+/// we delete `inner` ourselves.
+#[cfg(target_os = "windows")]
+unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ, RGN_DIFF,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    };
+
+    if overlay == 0 { return; }
+    let hw = HWND(overlay as *mut _);
+    let bw = border_width as i32;
+    let w  = rect.width  as i32;
+    let h  = rect.height as i32;
+
+    let _ = SetWindowPos(
+        hw,
+        HWND_TOPMOST,
+        rect.x, rect.y, w, h,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+
+    // Ring = outer - inner
+    let outer = CreateRectRgn(0, 0, w, h);
+    let inner = CreateRectRgn(bw, bw, (w - bw).max(0), (h - bw).max(0));
+    CombineRgn(outer, outer, inner, RGN_DIFF);
+    // OS takes ownership of `outer` after SetWindowRgn.
+    SetWindowRgn(hw, outer, true);
+    let _ = DeleteObject(HGDIOBJ(inner.0));
+}
 
 // ── WindowsWindow ─────────────────────────────────────────────────────────────
 
 pub struct WindowsWindow {
-    id: WindowId,
+    id:           WindowId,
     /// Raw HWND stored as `isize` so the struct is `Send`.
-    hwnd: isize,
-    title: String,
-    geometry: Rect,
-    floating: bool,
+    hwnd:         isize,
+    title:        String,
+    geometry:     Rect,
+    floating:     bool,
+    /// Set to `true` when *we* hide the window (workspace switch).
+    /// Prevents `SWE_CREATED` from re-adopting our own hidden windows.
+    wm_hidden:    bool,
+    /// Companion border overlay HWND, or 0 if not yet created.
+    overlay_hwnd: isize,
+    /// Last border width used for the overlay ring region (pixels).
+    border_width: u32,
+}
+
+impl Drop for WindowsWindow {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.overlay_hwnd != 0 {
+            unsafe {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+                let _ = DestroyWindow(HWND(self.overlay_hwnd as *mut _));
+            }
+        }
+    }
 }
 
 impl Window for WindowsWindow {
-    fn id(&self) -> WindowId { self.id }
-    fn title(&self) -> &str { &self.title }
-    fn geometry(&self) -> Rect { self.geometry }
+    fn id(&self)     -> WindowId { self.id }
+    fn title(&self)  -> &str    { &self.title }
+    fn geometry(&self) -> Rect  { self.geometry }
 
     fn set_geometry(&mut self, rect: Rect) -> Result<()> {
         #[cfg(target_os = "windows")]
@@ -63,8 +237,6 @@ impl Window for WindowsWindow {
                 SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
             };
             let hwnd = HWND(self.hwnd as *mut _);
-            // Maximized windows silently ignore SetWindowPos geometry.
-            // Restore first so the new tile dimensions take effect.
             if IsZoomed(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
@@ -73,11 +245,16 @@ impl Window for WindowsWindow {
                 HWND(std::ptr::null_mut()),
                 rect.x,
                 rect.y,
-                rect.width as i32,
+                rect.width  as i32,
                 rect.height as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
             .map_err(|e| Error::Backend(format!("SetWindowPos: {e}")))?;
+
+            // Keep overlay in sync.
+            if self.overlay_hwnd != 0 {
+                position_overlay(self.overlay_hwnd, rect, self.border_width);
+            }
         }
         self.geometry = rect;
         Ok(())
@@ -115,22 +292,43 @@ impl Window for WindowsWindow {
     fn is_floating(&self) -> bool { self.floating }
     fn set_floating(&mut self, floating: bool) { self.floating = floating; }
 
+    fn is_minimized(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+            unsafe { IsIconic(HWND(self.hwnd as *mut _)).as_bool() }
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+
     fn hide(&mut self) -> Result<()> {
+        self.wm_hidden = true;
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
             let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_HIDE);
+            // Hide overlay too.
+            if self.overlay_hwnd != 0 {
+                let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_HIDE);
+            }
         }
         Ok(())
     }
 
     fn show(&mut self) -> Result<()> {
+        self.wm_hidden = false;
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
             let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_SHOWNA);
+            // Show overlay too.
+            if self.overlay_hwnd != 0 {
+                let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_SHOWNA);
+            }
         }
         Ok(())
     }
@@ -141,7 +339,7 @@ impl Window for WindowsWindow {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
             let colorref = rgb_to_colorref(rgb);
-            // DWMWA_BORDER_COLOR = 34 — Windows 11 22H2+; silently no-ops on older builds.
+            // DWMWA_BORDER_COLOR = 34 — Windows 11 22H2+; silently no-ops elsewhere.
             if let Err(e) = DwmSetWindowAttribute(
                 HWND(self.hwnd as *mut _),
                 DWMWINDOWATTRIBUTE(34),
@@ -153,6 +351,51 @@ impl Window for WindowsWindow {
         }
         Ok(())
     }
+
+    fn hide_border_overlay(&mut self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if self.overlay_hwnd != 0 {
+            unsafe {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_HIDE);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_border_overlay(&mut self, rgb: u32, width: u32) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::Graphics::Gdi::InvalidateRect;
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+
+            let colorref = rgb_to_colorref(rgb);
+            self.border_width = width;
+
+            // Create overlay on first call.
+            if self.overlay_hwnd == 0 {
+                self.overlay_hwnd = create_overlay(self.geometry);
+                if self.overlay_hwnd == 0 {
+                    tracing::warn!(id = %self.id, "failed to create border overlay");
+                    return Ok(());
+                }
+            }
+
+            let hw = HWND(self.overlay_hwnd as *mut _);
+
+            // Store colour for WM_PAINT.
+            SetWindowLongPtrW(hw, GWLP_USERDATA, colorref as isize);
+
+            // Reposition + rebuild ring region.
+            position_overlay(self.overlay_hwnd, self.geometry, width);
+
+            // Repaint.
+            let _ = InvalidateRect(hw, None, false);
+        }
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,17 +404,12 @@ impl Window for WindowsWindow {
 #[cfg(target_os = "windows")]
 fn rgb_to_colorref(rgb: u32) -> u32 {
     let r = (rgb >> 16) & 0xFF;
-    let g = (rgb >> 8) & 0xFF;
-    let b = rgb & 0xFF;
+    let g = (rgb >> 8)  & 0xFF;
+    let b =  rgb        & 0xFF;
     r | (g << 8) | (b << 16)
 }
 
 /// Returns `true` if `hwnd` should be managed by shellwright.
-///
-/// Matches the filtering strategy used by komorebi / GlazeWM:
-/// - Visible, no owner, no WS_EX_TOOLWINDOW, has WS_CAPTION, non-empty title.
-/// - Not cloaked (virtual desktop, UWP shell windows, etc.).
-/// - Not a known system shell window class.
 #[cfg(target_os = "windows")]
 unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWINDOWATTRIBUTE};
@@ -182,7 +420,6 @@ unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
 
     if !IsWindowVisible(hwnd).as_bool() { return false; }
 
-    // Owned windows (dialogs, popups) are child surfaces, not top-level apps.
     if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
         if !owner.0.is_null() { return false; }
     }
@@ -190,15 +427,11 @@ unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     if ex_style & WS_EX_TOOLWINDOW.0 != 0 { return false; }
 
-    // WS_CAPTION = WS_BORDER | WS_DLGFRAME.  Windows without a caption bar
-    // (popup menus, splash screens, overlays) must not be tiled.
     let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
     if style & WS_CAPTION.0 == 0 { return false; }
 
     if GetWindowTextLengthW(hwnd) == 0 { return false; }
 
-    // DWMWA_CLOAKED (14) — non-zero for windows on other virtual desktops,
-    // UWP shell windows, and Windows animations.  Do not manage cloaked windows.
     let mut cloaked: u32 = 0;
     let _ = DwmGetWindowAttribute(
         hwnd,
@@ -208,18 +441,18 @@ unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
     );
     if cloaked != 0 { return false; }
 
-    // Exclude known system shell window classes that pass all other filters.
     let mut class_buf = [0u16; 256];
     let class_len = GetClassNameW(hwnd, &mut class_buf) as usize;
     if class_len > 0 {
         let class = String::from_utf16_lossy(&class_buf[..class_len]);
         match class.as_str() {
-            "Shell_TrayWnd"           // Windows taskbar
-            | "Shell_SecondaryTrayWnd" // Secondary monitor taskbar
-            | "Progman"               // Program Manager / desktop
-            | "WorkerW"               // Desktop wallpaper worker
-            | "DV2ControlHost"        // Start menu host
-            | "Windows.UI.Core.CoreWindow" // UWP shell window
+            "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Progman"
+            | "WorkerW"
+            | "DV2ControlHost"
+            | "Windows.UI.Core.CoreWindow"
+            | "shellwright_border"   // exclude our own overlays
             => return false,
             _ => {}
         }
@@ -228,7 +461,7 @@ unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
     true
 }
 
-/// Build a [`WindowsWindow`] from a raw HWND.  Returns `None` on any failure.
+/// Build a [`WindowsWindow`] from a raw HWND.  Returns `None` on failure.
 #[cfg(target_os = "windows")]
 unsafe fn build_window(
     hwnd: windows::Win32::Foundation::HWND,
@@ -250,16 +483,24 @@ unsafe fn build_window(
     let geometry = Rect::new(
         r.left,
         r.top,
-        (r.right - r.left) as u32,
-        (r.bottom - r.top) as u32,
+        (r.right  - r.left) as u32,
+        (r.bottom - r.top)  as u32,
     );
 
     tracing::debug!(%id, %title, ?geometry, "window registered");
-    Some(WindowsWindow { id, hwnd: hwnd.0 as isize, title, geometry, floating: false })
+    Some(WindowsWindow {
+        id,
+        hwnd: hwnd.0 as isize,
+        title,
+        geometry,
+        floating:     false,
+        wm_hidden:    false,
+        overlay_hwnd: 0,
+        border_width: 0,
+    })
 }
 
-// ── Update stored geometry for an existing window from Win32 ─────────────────
-
+/// Refresh the stored geometry from Win32 (called after a drag/resize).
 #[cfg(target_os = "windows")]
 unsafe fn refresh_geometry(win: &mut WindowsWindow) {
     use windows::Win32::Foundation::{HWND, RECT};
@@ -270,8 +511,8 @@ unsafe fn refresh_geometry(win: &mut WindowsWindow) {
         win.geometry = Rect::new(
             r.left,
             r.top,
-            (r.right - r.left) as u32,
-            (r.bottom - r.top) as u32,
+            (r.right  - r.left) as u32,
+            (r.bottom - r.top)  as u32,
         );
     }
 }
@@ -315,22 +556,23 @@ fn enumerate_windows(_next_id: &mut u64) -> Vec<WindowsWindow> { Vec::new() }
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn win_event_proc(
-    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
-    event: u32,
-    hwnd: windows::Win32::Foundation::HWND,
-    id_object: i32,
-    id_child: i32,
+    _hook:         windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event:         u32,
+    hwnd:          windows::Win32::Foundation::HWND,
+    id_object:     i32,
+    id_child:      i32,
     _event_thread: u32,
-    _event_time: u32,
+    _event_time:   u32,
 ) {
     if id_object != 0 || id_child != 0 { return; }
     if hwnd.0.is_null() { return; }
 
     let wp: usize = match event {
-        0x8002 => SWE_CREATED,      // EVENT_OBJECT_SHOW — window becomes visible (more reliable than CREATE)
-        0x8001 => SWE_DESTROYED,    // EVENT_OBJECT_DESTROY
-        0x0003 => SWE_FOCUSED,      // EVENT_SYSTEM_FOREGROUND
-        0x000B => SWE_MOVESIZEEND,  // EVENT_SYSTEM_MOVESIZEEND
+        0x8002 => SWE_CREATED,          // EVENT_OBJECT_SHOW
+        0x8001 => SWE_DESTROYED,        // EVENT_OBJECT_DESTROY
+        0x0003 => SWE_FOCUSED,          // EVENT_SYSTEM_FOREGROUND
+        0x000B => SWE_MOVESIZEEND,      // EVENT_SYSTEM_MOVESIZEEND
+        0x0016 | 0x0017 => SWE_MINIMIZE_CHANGE, // EVENT_SYSTEM_MINIMIZESTART / MINIMIZEEND
         _ => return,
     };
 
@@ -364,10 +606,10 @@ impl Drop for HookGuards {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct WindowsBackend {
-    windows: Vec<WindowsWindow>,
-    next_id: u64,
+    windows:  Vec<WindowsWindow>,
+    next_id:  u64,
     _hotkeys: HotkeyManager,
-    _hooks: HookGuards,
+    _hooks:   HookGuards,
 }
 
 impl WindowsBackend {
@@ -385,20 +627,27 @@ impl WindowsBackend {
             let tid = unsafe { GetCurrentThreadId() };
             HOOK_THREAD_ID.store(tid, Ordering::Relaxed);
 
-            // WINEVENT_OUTOFCONTEXT (0x0000) | WINEVENT_SKIPOWNPROCESS (0x0002)
-            let flags: u32 = 0x0002;
+            // Register border overlay window class (idempotent).
+            if BORDER_CLASS_ATOM.load(Ordering::Relaxed) == 0 {
+                let atom = unsafe { register_border_class() };
+                if atom != 0 {
+                    BORDER_CLASS_ATOM.store(atom, Ordering::Relaxed);
+                    tracing::debug!(atom, "border class registered");
+                } else {
+                    tracing::warn!("RegisterClassExW failed for border class");
+                }
+            }
+
+            let flags: u32 = 0x0002; // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
 
             let hook_handles: Vec<isize> = unsafe {
                 vec![
-                    // Window show — fires when window first becomes visible; title is set by now.
-                    // More reliable than EVENT_OBJECT_CREATE (0x8000) which fires too early.
                     SetWinEventHook(0x8002, 0x8002, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
-                    // Window destroy
                     SetWinEventHook(0x8001, 0x8001, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
-                    // Foreground (focus) change
                     SetWinEventHook(0x0003, 0x0003, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
-                    // Move/resize end — for snap-to-tile on drag
                     SetWinEventHook(0x000B, 0x000B, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
+                    // Minimize start + minimize end (restore) — both trigger relayout.
+                    SetWinEventHook(0x0016, 0x0017, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                 ]
             };
             for &h in &hook_handles {
@@ -435,7 +684,7 @@ impl Backend for WindowsBackend {
         {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetMessageW, MSG, WM_HOTKEY, WM_QUIT,
+                DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_HOTKEY, WM_QUIT,
             };
 
             let mut msg = MSG::default();
@@ -462,8 +711,18 @@ impl Backend for WindowsBackend {
 
                         match msg.wParam.0 {
                             SWE_CREATED => {
-                                if self.windows.iter().any(|w| w.hwnd == hwnd_val) {
-                                    continue;
+                                // If window already tracked but hidden by us, re-hide it
+                                // (SWE_CREATED fires when our SW_HIDE animates away).
+                                if let Some(w) = self.windows.iter_mut().find(|w| w.hwnd == hwnd_val) {
+                                    if w.wm_hidden {
+                                        #[cfg(target_os = "windows")]
+                                        unsafe {
+                                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                                            let _ = ShowWindow(HWND(w.hwnd as *mut _), SW_HIDE);
+                                        }
+                                        continue;
+                                    }
+                                    continue; // already tracked and visible — ignore
                                 }
                                 if unsafe { is_manageable(hwnd) } {
                                     let id = WindowId(self.next_id);
@@ -479,7 +738,7 @@ impl Backend for WindowsBackend {
                             SWE_DESTROYED => {
                                 if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val) {
                                     let id = self.windows[pos].id;
-                                    self.windows.remove(pos);
+                                    self.windows.remove(pos); // Drop runs, destroys overlay
                                     tracing::debug!(%id, "window destroyed");
                                     return Ok(Event::WindowDestroyed(id));
                                 }
@@ -491,7 +750,7 @@ impl Backend for WindowsBackend {
                                     tracing::debug!(%id, "window focused");
                                     return Ok(Event::WindowFocused(id));
                                 }
-                                // Adopt previously untracked window that gains focus.
+                                // Adopt untracked window gaining focus.
                                 if unsafe { is_manageable(hwnd) } {
                                     let id = WindowId(self.next_id);
                                     self.next_id += 1;
@@ -506,11 +765,18 @@ impl Backend for WindowsBackend {
 
                             SWE_MOVESIZEEND => {
                                 if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val) {
-                                    // Refresh geometry so the WM knows where the user dragged it.
                                     unsafe { refresh_geometry(&mut self.windows[pos]); }
                                     let id = self.windows[pos].id;
                                     tracing::debug!(%id, "move/resize end");
                                     return Ok(Event::WindowMoved { id });
+                                }
+                            }
+
+                            SWE_MINIMIZE_CHANGE => {
+                                if let Some(w) = self.windows.iter().find(|w| w.hwnd == hwnd_val) {
+                                    let id = w.id;
+                                    tracing::debug!(%id, "minimize state changed");
+                                    return Ok(Event::WindowMinimizeChanged { id });
                                 }
                             }
 
@@ -519,7 +785,14 @@ impl Backend for WindowsBackend {
                         continue;
                     }
 
-                    _ => continue,
+                    _ => {
+                        // Dispatch to WndProc (e.g. WM_PAINT for border overlay windows).
+                        unsafe {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        continue;
+                    }
                 }
             }
         }
@@ -575,7 +848,7 @@ impl Backend for WindowsBackend {
                     let mut info: MONITORINFO = std::mem::zeroed();
                     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
                     if GetMonitorInfoW(hmon, &mut info).as_bool() {
-                        let r = info.rcWork; // work area (excludes taskbar on that monitor)
+                        let r = info.rcWork;
                         return Rect::new(
                             r.left,
                             r.top,

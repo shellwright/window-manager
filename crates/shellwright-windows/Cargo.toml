@@ -21,5 +21,6 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Threading",   # GetCurrentThreadId
     "Win32_Graphics_Dwm",       # DwmSetWindowAttribute (border colour, Win11+)
-    "Win32_Graphics_Gdi",       # MonitorFromWindow / GetMonitorInfoW (multi-monitor)
+    "Win32_Graphics_Gdi",       # MonitorFromWindow / GetMonitorInfoW / GDI overlay borders
+    "Win32_System_LibraryLoader", # GetModuleHandleW (HINSTANCE for RegisterClassExW)
 ] }

@@ -53,12 +53,29 @@ pub trait Window: Send + Sync + 'static {
     fn hide(&mut self) -> Result<()>;
     /// Restore a hidden window to visibility.
     fn show(&mut self) -> Result<()>;
-    /// Set the window border colour.
+    /// Set the window border colour via the compositor API.
     ///
     /// `rgb` is `0x00RRGGBB`.  Backends that support coloured borders (e.g.
     /// Windows 11 via `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`) override
     /// this; all others use the provided no-op default.
     fn set_border_color(&mut self, _rgb: u32) -> Result<()> { Ok(()) }
+
+    /// Returns `true` if the window is currently minimised (iconic).
+    ///
+    /// Minimised windows must not count toward the tiling layout.
+    fn is_minimized(&self) -> bool { false }
+
+    /// Create or update a thick GDI overlay border drawn around this window.
+    ///
+    /// `rgb` is `0x00RRGGBB`; `width` is the border thickness in physical pixels.
+    /// Backends that implement overlay borders (Windows via `SetWindowRgn`) override
+    /// this; all others use the provided no-op default.
+    fn set_border_overlay(&mut self, _rgb: u32, _width: u32) -> Result<()> { Ok(()) }
+
+    /// Hide the border overlay without destroying it.
+    ///
+    /// Called for fullscreen and minimised windows where no visible border is wanted.
+    fn hide_border_overlay(&mut self) -> Result<()> { Ok(()) }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

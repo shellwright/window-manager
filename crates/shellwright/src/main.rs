@@ -122,11 +122,57 @@ fn event_loop<B: Backend>(
                 }
             }
 
+            Event::WindowMinimizeChanged { id } => {
+                // A window was minimised or restored.  Relayout so other tiles
+                // fill / vacate the freed slot.  update_borders will hide the
+                // overlay for the minimised window automatically.
+                if workspaces[active_ws].contains(id) {
+                    apply_layout(&mut backend, &workspaces[active_ws], &config);
+                    update_borders(&mut backend, &workspaces[active_ws], &config);
+                }
+            }
+
             Event::WindowMoved { id } => {
-                // Non-floating windows snap back to their tile slot (komorebi-style).
-                // Floating windows keep wherever the user dragged them.
+                // For non-floating tiled windows: find the closest other tiled window by
+                // centre-point distance and swap their positions in the workspace order,
+                // then re-tile.  This gives komorebi-style drag-to-swap behaviour.
                 if workspaces[active_ws].contains(id) {
                     if backend.window_mut(id).map_or(false, |w| !w.is_floating()) {
+                        let dragged_center = backend
+                            .window_mut(id)
+                            .map(|w| center_of(w.geometry()))
+                            .unwrap_or((0, 0));
+
+                        // Collect (WindowId, center) for all other tiled, non-minimized windows.
+                        let candidates: Vec<(WindowId, (i32, i32))> = workspaces[active_ws]
+                            .windows()
+                            .iter()
+                            .copied()
+                            .filter(|&wid| wid != id)
+                            .filter_map(|wid| {
+                                backend.window_mut(wid).and_then(|w| {
+                                    if !w.is_floating() && !w.is_minimized() {
+                                        Some((wid, center_of(w.geometry())))
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .collect();
+
+                        if let Some((target, _)) = candidates
+                            .into_iter()
+                            .min_by_key(|(_, c)| dist_sq(dragged_center, *c))
+                        {
+                            let windows = workspaces[active_ws].windows_mut();
+                            if let (Some(a), Some(b)) = (
+                                windows.iter().position(|&w| w == id),
+                                windows.iter().position(|&w| w == target),
+                            ) {
+                                windows.swap(a, b);
+                            }
+                        }
+
                         apply_layout(&mut backend, &workspaces[active_ws], &config);
                         update_borders(&mut backend, &workspaces[active_ws], &config);
                     }
@@ -176,7 +222,9 @@ fn apply_layout<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Con
         .copied()
         .filter(|&id| {
             !workspace.is_fullscreen(id)
-                && backend.window_mut(id).map_or(false, |w| !w.is_floating())
+                && backend.window_mut(id).map_or(false, |w| {
+                    !w.is_floating() && !w.is_minimized()
+                })
         })
         .collect();
 
@@ -238,19 +286,33 @@ fn apply_padding(r: Rect, p: Padding) -> Rect {
 
 // ── Border helpers ────────────────────────────────────────────────────────────
 
-/// Update every window's border colour: active for the focused window,
-/// inactive for all others.
+/// Update every window's border overlay.
 ///
-/// On Windows 11+ this drives `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`.
-/// All other backends use the default no-op `set_border_color`.
+/// - Fullscreen windows: overlay hidden (full-screen real estate, no chrome wanted).
+/// - Minimised windows: overlay hidden (window is iconic, nothing to decorate).
+/// - All others: active colour for focused, inactive for the rest.
+///
+/// Draws a thick GDI ring via `set_border_overlay` (works on all Windows versions).
+/// Also calls `set_border_color` for the thin DWM accent on Windows 11+.
 fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Config) {
     let active_color   = parse_hex_color(&config.border_active);
     let inactive_color = parse_hex_color(&config.border_inactive);
 
     for &id in workspace.windows() {
+        let is_full      = workspace.is_fullscreen(id);
+        let is_minimized = backend.window_mut(id).map_or(false, |w| w.is_minimized());
+
+        if is_full || is_minimized {
+            if let Some(w) = backend.window_mut(id) {
+                let _ = w.hide_border_overlay();
+            }
+            continue;
+        }
+
         let color = if workspace.focused == Some(id) { active_color } else { inactive_color };
         if let Some(w) = backend.window_mut(id) {
-            let _ = w.set_border_color(color);
+            let _ = w.set_border_overlay(color, config.border_width);
+            let _ = w.set_border_color(color); // DWM accent (Win11+, no-op elsewhere)
         }
     }
 }
@@ -470,7 +532,7 @@ fn toggle_fullscreen_for<B: Backend>(
         workspace.enter_fullscreen(id, saved);
         tracing::info!(%id, "enter fullscreen");
 
-        let monitor = apply_padding(backend.monitor_rect(), config.padding);
+        let monitor = apply_padding(backend.monitor_rect_for_window(id), config.padding);
         if let Some(w) = backend.window_mut(id) {
             if let Err(e) = w.set_geometry(monitor) {
                 tracing::warn!(%id, err = %e, "set_geometry (enter fullscreen) failed");
@@ -480,6 +542,18 @@ fn toggle_fullscreen_for<B: Backend>(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the centre point of a rect.
+fn center_of(r: Rect) -> (i32, i32) {
+    (r.x + r.width as i32 / 2, r.y + r.height as i32 / 2)
+}
+
+/// Squared Euclidean distance between two points (avoids `sqrt`).
+fn dist_sq(a: (i32, i32), b: (i32, i32)) -> i64 {
+    let dx = (a.0 - b.0) as i64;
+    let dy = (a.1 - b.1) as i64;
+    dx * dx + dy * dy
+}
 
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
