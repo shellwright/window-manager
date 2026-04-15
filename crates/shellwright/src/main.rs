@@ -4,7 +4,7 @@ use anyhow::Context;
 use shellwright_core::{
     action::Action,
     backend::Backend,
-    config::Config,
+    config::{Config, Padding},
     event::Event,
     hotkey::BindingMap,
     layout,
@@ -70,6 +70,21 @@ fn event_loop<B: Backend>(
 
     tracing::info!(workspaces = workspaces.len(), "entering event loop");
 
+    // ── Seed workspace 0 with all windows already open at startup ────────────
+    // `enumerate_windows` in the backend captures pre-existing windows but
+    // never fires WindowCreated events for them — so we seed manually.
+    {
+        let ids: Vec<WindowId> = backend.windows().iter().map(|w| w.id()).collect();
+        tracing::info!(count = ids.len(), "seeding startup windows into workspace 1");
+        for id in ids {
+            workspaces[0].add_window(id);
+        }
+        if !workspaces[0].windows().is_empty() {
+            apply_layout(&mut backend, &workspaces[0], &config);
+            update_borders(&mut backend, &workspaces[0], &config);
+        }
+    }
+
     loop {
         let event = backend.next_event()?;
         tracing::debug!(?event, "event");
@@ -83,7 +98,8 @@ fn event_loop<B: Backend>(
             Event::WindowCreated(id) => {
                 tracing::info!(%id, workspace = %workspaces[active_ws].name, "window created");
                 workspaces[active_ws].add_window(id);
-                apply_layout(&mut backend, &workspaces[active_ws], config.gap);
+                apply_layout(&mut backend, &workspaces[active_ws], &config);
+                update_borders(&mut backend, &workspaces[active_ws], &config);
             }
 
             Event::WindowDestroyed(id) => {
@@ -91,16 +107,30 @@ fn event_loop<B: Backend>(
                 for ws in &mut workspaces {
                     ws.remove_window(id);
                 }
-                apply_layout(&mut backend, &workspaces[active_ws], config.gap);
+                apply_layout(&mut backend, &workspaces[active_ws], &config);
+                update_borders(&mut backend, &workspaces[active_ws], &config);
             }
 
             Event::WindowFocused(id) => {
                 tracing::debug!(%id, "focused");
-                workspaces[active_ws].focused = Some(id);
+                // Only update focus if the window belongs to the active workspace.
+                // Spurious focus events from hiding workspace windows during a switch
+                // must not corrupt the focus state of the incoming workspace.
+                if workspaces[active_ws].contains(id) {
+                    workspaces[active_ws].focused = Some(id);
+                    update_borders(&mut backend, &workspaces[active_ws], &config);
+                }
             }
 
-            Event::WindowMoved { .. } => {
-                // Floating window moved by user — no layout recomputation needed.
+            Event::WindowMoved { id } => {
+                // Non-floating windows snap back to their tile slot (komorebi-style).
+                // Floating windows keep wherever the user dragged them.
+                if workspaces[active_ws].contains(id) {
+                    if backend.window_mut(id).map_or(false, |w| !w.is_floating()) {
+                        apply_layout(&mut backend, &workspaces[active_ws], &config);
+                        update_borders(&mut backend, &workspaces[active_ws], &config);
+                    }
+                }
             }
 
             Event::Keybinding(kb_id) => {
@@ -127,13 +157,19 @@ fn event_loop<B: Backend>(
 
 /// Compute and apply tiling geometry for every window in `workspace`.
 ///
-/// - Floating windows are skipped (their geometry is user-managed).
-/// - Fullscreen windows always receive the full `monitor_rect`.
-/// - All other windows receive layout-computed slots shrunk by `gap` pixels.
-fn apply_layout<B: Backend>(backend: &mut B, workspace: &Workspace, gap: u32) {
-    let monitor = backend.monitor_rect();
+/// Windows are grouped by the monitor they currently occupy so that a
+/// workspace spanning multiple monitors tiles each monitor independently.
+///
+/// Order of operations per monitor:
+/// 1. `monitor_rect_for_window()` — work area for that monitor.
+/// 2. Apply `config.padding` — reserves space for external bars (e.g. YASB).
+/// 3. Partition windows into tiled / floating / fullscreen.
+/// 4. `layout::compute` for the tiled set; shrink each slot by `gap`.
+/// 5. Fullscreen windows receive the full padded area of their monitor.
+fn apply_layout<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Config) {
+    use std::collections::HashMap;
 
-    // Collect windows that should participate in tiling (not floating, not fullscreen).
+    // ── Tiled windows grouped by monitor ─────────────────────────────────────
     let tiled: Vec<WindowId> = workspace
         .windows()
         .iter()
@@ -144,19 +180,33 @@ fn apply_layout<B: Backend>(backend: &mut B, workspace: &Workspace, gap: u32) {
         })
         .collect();
 
-    let slots = layout::compute(&workspace.layout, monitor, tiled.len());
+    // Key: (x, y, w, h) of the raw monitor work-area (before padding).
+    let mut by_monitor: HashMap<(i32, i32, u32, u32), Vec<WindowId>> = HashMap::new();
+    for &id in &tiled {
+        let mr = backend.monitor_rect_for_window(id);
+        by_monitor
+            .entry((mr.x, mr.y, mr.width, mr.height))
+            .or_default()
+            .push(id);
+    }
 
-    for (&id, slot) in tiled.iter().zip(slots.iter()) {
-        let rect = inset(slot.rect, gap);
-        if let Some(w) = backend.window_mut(id) {
-            if let Err(e) = w.set_geometry(rect) {
-                tracing::warn!(%id, err = %e, "set_geometry failed");
+    for ((x, y, w, h), ids) in &by_monitor {
+        let monitor = apply_padding(Rect::new(*x, *y, *w, *h), config.padding);
+        let slots = layout::compute(&workspace.layout, monitor, ids.len());
+        for (&id, slot) in ids.iter().zip(slots.iter()) {
+            let rect = inset(slot.rect, config.gap);
+            if let Some(win) = backend.window_mut(id) {
+                if let Err(e) = win.set_geometry(rect) {
+                    tracing::warn!(%id, err = %e, "set_geometry failed");
+                }
             }
         }
     }
 
-    // Fullscreen windows cover the entire monitor regardless of layout.
+    // ── Fullscreen windows ────────────────────────────────────────────────────
     for id in workspace.fullscreen_windows() {
+        let mr = backend.monitor_rect_for_window(id);
+        let monitor = apply_padding(mr, config.padding);
         if let Some(w) = backend.window_mut(id) {
             if let Err(e) = w.set_geometry(monitor) {
                 tracing::warn!(%id, err = %e, "set_geometry (fullscreen) failed");
@@ -174,6 +224,42 @@ fn inset(r: Rect, gap: u32) -> Rect {
         r.width.saturating_sub(2 * gap),
         r.height.saturating_sub(2 * gap),
     )
+}
+
+/// Subtract padding from a monitor rect (reserves space for external bars).
+fn apply_padding(r: Rect, p: Padding) -> Rect {
+    Rect::new(
+        r.x + p.left as i32,
+        r.y + p.top as i32,
+        r.width.saturating_sub(p.left + p.right),
+        r.height.saturating_sub(p.top + p.bottom),
+    )
+}
+
+// ── Border helpers ────────────────────────────────────────────────────────────
+
+/// Update every window's border colour: active for the focused window,
+/// inactive for all others.
+///
+/// On Windows 11+ this drives `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`.
+/// All other backends use the default no-op `set_border_color`.
+fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Config) {
+    let active_color   = parse_hex_color(&config.border_active);
+    let inactive_color = parse_hex_color(&config.border_inactive);
+
+    for &id in workspace.windows() {
+        let color = if workspace.focused == Some(id) { active_color } else { inactive_color };
+        if let Some(w) = backend.window_mut(id) {
+            let _ = w.set_border_color(color);
+        }
+    }
+}
+
+/// Parse `#RRGGBB` (or `RRGGBB`) to a `0x00RRGGBB` `u32`.
+/// Falls back to mid-grey on invalid input.
+fn parse_hex_color(s: &str) -> u32 {
+    let s = s.trim_start_matches('#');
+    u32::from_str_radix(s, 16).unwrap_or(0x88_88_88)
 }
 
 // ── Action dispatch ───────────────────────────────────────────────────────────
@@ -201,6 +287,7 @@ fn dispatch<B: Backend>(
                     tracing::warn!(id = %next_id, err = %e, "focus failed");
                 }
             }
+            update_borders(backend, &workspaces[*active_ws], config);
         }
 
         Action::FocusPrev => {
@@ -218,6 +305,7 @@ fn dispatch<B: Backend>(
                     tracing::warn!(id = %prev_id, err = %e, "focus failed");
                 }
             }
+            update_borders(backend, &workspaces[*active_ws], config);
         }
 
         // ── Window manipulation ───────────────────────────────────────────────
@@ -230,7 +318,7 @@ fn dispatch<B: Backend>(
                     windows.swap(pos, next);
                 }
             }
-            apply_layout(backend, &workspaces[*active_ws], config.gap);
+            apply_layout(backend, &workspaces[*active_ws], config);
         }
 
         Action::MovePrev => {
@@ -242,7 +330,7 @@ fn dispatch<B: Backend>(
                     windows.swap(pos, prev);
                 }
             }
-            apply_layout(backend, &workspaces[*active_ws], config.gap);
+            apply_layout(backend, &workspaces[*active_ws], config);
         }
 
         Action::KillFocused => {
@@ -263,7 +351,7 @@ fn dispatch<B: Backend>(
                     w.set_floating(now);
                     tracing::debug!(%id, floating = now, "toggle float");
                 }
-                apply_layout(backend, &workspaces[*active_ws], config.gap);
+                apply_layout(backend, &workspaces[*active_ws], config);
             }
         }
 
@@ -272,7 +360,7 @@ fn dispatch<B: Backend>(
                 workspaces[*active_ws].focused,
                 backend,
                 &mut workspaces[*active_ws],
-                config.gap,
+                config,
             );
         }
 
@@ -280,7 +368,7 @@ fn dispatch<B: Backend>(
         Action::SetLayout(kind) => {
             tracing::info!(?kind, workspace = %workspaces[*active_ws].name, "set layout");
             workspaces[*active_ws].layout = kind;
-            apply_layout(backend, &workspaces[*active_ws], config.gap);
+            apply_layout(backend, &workspaces[*active_ws], config);
         }
 
         // ── Workspaces ───────────────────────────────────────────────────────
@@ -288,7 +376,7 @@ fn dispatch<B: Backend>(
             let idx = (n as usize).saturating_sub(1);
             if idx >= workspaces.len() || idx == *active_ws { return; }
 
-            // Hide all windows on the current workspace.
+            // Hide every window on the outgoing workspace.
             for &id in workspaces[*active_ws].windows() {
                 if let Some(w) = backend.window_mut(id) {
                     let _ = w.hide();
@@ -297,15 +385,16 @@ fn dispatch<B: Backend>(
 
             *active_ws = idx;
 
-            // Restore and re-tile the target workspace.
+            // Show and re-tile the incoming workspace.
             for &id in workspaces[*active_ws].windows() {
                 if let Some(w) = backend.window_mut(id) {
                     let _ = w.show();
                 }
             }
-            apply_layout(backend, &workspaces[*active_ws], config.gap);
+            apply_layout(backend, &workspaces[*active_ws], config);
+            update_borders(backend, &workspaces[*active_ws], config);
 
-            // Focus the previously-focused window on the new workspace.
+            // Restore focus on the incoming workspace.
             if let Some(id) = workspaces[*active_ws].focused {
                 if let Some(w) = backend.window_mut(id) {
                     let _ = w.focus();
@@ -320,18 +409,22 @@ fn dispatch<B: Backend>(
             if target >= workspaces.len() || target == *active_ws { return; }
 
             if let Some(id) = workspaces[*active_ws].focused {
-                // Clear fullscreen state before moving.
+                // Clear fullscreen before moving.
                 workspaces[*active_ws].exit_fullscreen(id);
                 workspaces[*active_ws].remove_window(id);
 
-                // Hide the window since it's now on an inactive workspace.
+                // Hide: the window is now on an inactive workspace.
                 if let Some(w) = backend.window_mut(id) {
                     let _ = w.hide();
+                    // Reset to inactive border before moving out of visible workspace.
+                    let inactive = parse_hex_color(&config.border_inactive);
+                    let _ = w.set_border_color(inactive);
                 }
 
                 workspaces[target].add_window(id);
                 tracing::info!(%id, to = %workspaces[target].name, "move window to workspace");
-                apply_layout(backend, &workspaces[*active_ws], config.gap);
+                apply_layout(backend, &workspaces[*active_ws], config);
+                update_borders(backend, &workspaces[*active_ws], config);
             }
         }
 
@@ -350,18 +443,15 @@ fn dispatch<B: Backend>(
 
 // ── Fullscreen ────────────────────────────────────────────────────────────────
 
-/// Toggle fullscreen for a specific window by ID (or the focused window when
-/// `target` is `None`).
+/// Toggle fullscreen for a specific window by ID (or focused if `target` is `None`).
 ///
-/// This is the core of the per-window fullscreen feature:
-/// - **Entering**: saves the current geometry, sets the window to the full
-///   monitor rect, and removes it from tiling layout.
-/// - **Exiting**: restores the saved geometry and re-tiles the workspace.
+/// - **Entering**: saves current geometry, sets window to padded monitor rect.
+/// - **Exiting**: restores saved geometry and re-tiles the workspace.
 fn toggle_fullscreen_for<B: Backend>(
     target: Option<WindowId>,
     backend: &mut B,
     workspace: &mut Workspace,
-    gap: u32,
+    config: &Config,
 ) {
     let id = match target {
         Some(id) => id,
@@ -369,15 +459,10 @@ fn toggle_fullscreen_for<B: Backend>(
     };
 
     if workspace.is_fullscreen(id) {
-        // ── Exit fullscreen ────────────────────────────────────────────────
         workspace.exit_fullscreen(id);
         tracing::info!(%id, "exit fullscreen");
-        // Re-tile everything; apply_layout will skip fullscreen windows, of
-        // which there are now fewer (possibly zero).
-        apply_layout(backend, workspace, gap);
+        apply_layout(backend, workspace, config);
     } else {
-        // ── Enter fullscreen ───────────────────────────────────────────────
-        // Save the current geometry so we can restore it on exit.
         let saved = backend
             .window_mut(id)
             .map(|w| w.geometry())
@@ -385,9 +470,7 @@ fn toggle_fullscreen_for<B: Backend>(
         workspace.enter_fullscreen(id, saved);
         tracing::info!(%id, "enter fullscreen");
 
-        // Apply the full monitor rect immediately without waiting for the next
-        // layout pass.
-        let monitor = backend.monitor_rect();
+        let monitor = apply_padding(backend.monitor_rect(), config.padding);
         if let Some(w) = backend.window_mut(id) {
             if let Err(e) = w.set_geometry(monitor) {
                 tracing::warn!(%id, err = %e, "set_geometry (enter fullscreen) failed");

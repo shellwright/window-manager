@@ -19,6 +19,5 @@ smithay = { version = "0.3", default-features = false, features = [
     "backend_libinput",
     "backend_udev",
     "wayland_frontend",
-    "desktop",
 ] }
 calloop = "0.13"

@@ -37,4 +37,12 @@ pub trait Backend: Send + 'static {
     /// On macOS this is `NSScreen.visibleFrame` (excluding menu bar and Dock).
     /// On Wayland this is the output geometry minus any wlr-layer-shell reservations.
     fn monitor_rect(&self) -> Rect;
+
+    /// Return the usable tiling area for the monitor that contains `id`.
+    ///
+    /// Backends with multi-monitor support override this; the default falls
+    /// back to [`Backend::monitor_rect`] (primary monitor).
+    fn monitor_rect_for_window(&self, _id: WindowId) -> Rect {
+        self.monitor_rect()
+    }
 }

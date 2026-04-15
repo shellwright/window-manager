@@ -53,6 +53,12 @@ pub trait Window: Send + Sync + 'static {
     fn hide(&mut self) -> Result<()>;
     /// Restore a hidden window to visibility.
     fn show(&mut self) -> Result<()>;
+    /// Set the window border colour.
+    ///
+    /// `rgb` is `0x00RRGGBB`.  Backends that support coloured borders (e.g.
+    /// Windows 11 via `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`) override
+    /// this; all others use the provided no-op default.
+    fn set_border_color(&mut self, _rgb: u32) -> Result<()> { Ok(()) }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

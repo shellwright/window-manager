@@ -10,14 +10,35 @@ use crate::layout::LayoutKind;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Screen-edge padding in physical pixels.
+///
+/// Use this to reserve space for external status bars (e.g. YASB) that do not
+/// register themselves with `SPI_SETWORKAREA`.  Shellwright subtracts these
+/// values from the monitor work-area before computing tile slots.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Padding {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
 /// Top-level configuration loaded from `config.toml`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Gap between tiled windows in physical pixels.
     pub gap: u32,
-    /// Border width in physical pixels.
+    /// Border width in physical pixels (used by compositor / overlay backends).
     pub border_width: u32,
+    /// Border colour for the focused window (hex `#RRGGBB`).
+    /// On Windows 11 this is applied via `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)`.
+    pub border_active: String,
+    /// Border colour for all unfocused windows (hex `#RRGGBB`).
+    pub border_inactive: String,
+    /// Screen-edge padding to reserve for external bars (e.g. YASB).
+    pub padding: Padding,
     pub workspaces: Vec<WorkspaceConfig>,
     pub keybindings: Vec<Keybinding>,
     pub default_layout: LayoutKind,
@@ -28,11 +49,67 @@ impl Default for Config {
         Self {
             gap: 8,
             border_width: 2,
+            border_active:   "#5E81AC".into(), // Nord blue
+            border_inactive: "#3B4252".into(), // Nord dark
+            padding: Padding::default(),
             workspaces: (1..=9).map(|i| WorkspaceConfig { name: i.to_string() }).collect(),
-            keybindings: vec![],
+            keybindings: default_keybindings(),
             default_layout: LayoutKind::default(),
         }
     }
+}
+
+/// Built-in keybindings used when no config file is present.
+///
+/// Mirrors the defaults documented in `config.toml`.  All use the Super (Win)
+/// key as the primary modifier, matching the komorebi / i3 convention.
+fn default_keybindings() -> Vec<Keybinding> {
+    fn kb(modifiers: &[&str], key: &str, action: &str) -> Keybinding {
+        Keybinding {
+            modifiers: modifiers.iter().map(|s| s.to_string()).collect(),
+            key: key.into(),
+            action: action.into(),
+        }
+    }
+    vec![
+        // Focus
+        kb(&["alt"],         "h", "focus_prev"),
+        kb(&["alt"],         "l", "focus_next"),
+        // Move window in layout order
+        kb(&["alt", "shift"], "h", "move_prev"),
+        kb(&["alt", "shift"], "l", "move_next"),
+        // Close / float / fullscreen
+        kb(&["alt", "shift"], "q",     "kill_focused"),
+        kb(&["alt"],          "f",     "toggle_fullscreen"),
+        kb(&["alt", "shift"], "space", "toggle_float"),
+        // Layouts
+        kb(&["alt"], "t", "set_layout:bsp"),
+        kb(&["alt"], "m", "set_layout:monocle"),
+        kb(&["alt"], "c", "set_layout:columns:2"),
+        // Workspace switch (Alt+1..9)
+        kb(&["alt"], "1", "switch_workspace:1"),
+        kb(&["alt"], "2", "switch_workspace:2"),
+        kb(&["alt"], "3", "switch_workspace:3"),
+        kb(&["alt"], "4", "switch_workspace:4"),
+        kb(&["alt"], "5", "switch_workspace:5"),
+        kb(&["alt"], "6", "switch_workspace:6"),
+        kb(&["alt"], "7", "switch_workspace:7"),
+        kb(&["alt"], "8", "switch_workspace:8"),
+        kb(&["alt"], "9", "switch_workspace:9"),
+        // Move to workspace (Alt+Shift+1..9)
+        kb(&["alt", "shift"], "1", "move_to_workspace:1"),
+        kb(&["alt", "shift"], "2", "move_to_workspace:2"),
+        kb(&["alt", "shift"], "3", "move_to_workspace:3"),
+        kb(&["alt", "shift"], "4", "move_to_workspace:4"),
+        kb(&["alt", "shift"], "5", "move_to_workspace:5"),
+        kb(&["alt", "shift"], "6", "move_to_workspace:6"),
+        kb(&["alt", "shift"], "7", "move_to_workspace:7"),
+        kb(&["alt", "shift"], "8", "move_to_workspace:8"),
+        kb(&["alt", "shift"], "9", "move_to_workspace:9"),
+        // WM lifecycle
+        kb(&["alt", "shift"], "r", "reload_config"),
+        kb(&["alt", "shift"], "e", "quit"),
+    ]
 }
 
 #[derive(Debug, Serialize, Deserialize)]

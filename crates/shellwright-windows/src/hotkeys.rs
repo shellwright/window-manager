@@ -36,30 +36,46 @@ mod platform {
     impl HotkeyManager {
         pub fn register(map: &BindingMap) -> Result<Self> {
             let mut registered_ids = Vec::new();
+            let mut skipped = 0u32;
 
             for (id, combo, _action) in map.iter() {
-                let vk = key_to_vk(&combo.key)?;
-                let mods = mods_to_win32(combo.modifiers) | MOD_NOREPEAT;
-                let win_id = id.0 as i32;
-
-                let ok = unsafe { RegisterHotKey(None, win_id, mods, vk as u32) };
-                if ok.is_err() {
-                    // Unregister already-registered keys before returning error.
-                    for prev in &registered_ids {
-                        let _ = unsafe { UnregisterHotKey(None, *prev) };
+                let vk = match key_to_vk(&combo.key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(key = %combo.key.0, err = %e, "skipping hotkey — unknown key name");
+                        skipped += 1;
+                        continue;
                     }
-                    return Err(Error::Backend(format!(
-                        "RegisterHotKey failed for id={win_id} key={} (already claimed?)",
-                        combo.key.0
-                    )));
-                }
+                };
+                let mods = mods_to_win32(combo.modifiers) | MOD_NOREPEAT;
+                // Use id+1 so the first binding gets win_id=1, never 0.
+                // (Some Win32 internals treat hotkey-id 0 specially.)
+                let win_id = (id.0 + 1) as i32;
 
-                tracing::debug!(
-                    id = win_id,
-                    key = %combo.key.0,
-                    "registered hotkey"
+                match unsafe { RegisterHotKey(None, win_id, mods, vk as u32) } {
+                    Ok(_) => {
+                        tracing::debug!(id = win_id, key = %combo.key.0, "registered hotkey");
+                        registered_ids.push(win_id);
+                    }
+                    Err(_) => {
+                        // Soft-fail: many Super+key combos are reserved by Windows
+                        // (e.g. Win+H = Voice Typing on Win11).  Log and continue.
+                        tracing::warn!(
+                            id = win_id,
+                            key = %combo.key.0,
+                            "hotkey already claimed by system/another app — skipping"
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped,
+                    registered = registered_ids.len(),
+                    "some hotkeys could not be registered (claimed by OS or another app)"
                 );
-                registered_ids.push(win_id);
             }
 
             Ok(Self { registered_ids })
@@ -67,8 +83,9 @@ mod platform {
 
         /// Called by the message loop when `WM_HOTKEY` arrives.
         /// The `wparam` of `WM_HOTKEY` is the id passed to `RegisterHotKey`.
+        /// We register with `id.0 + 1`, so subtract 1 to recover the `KeybindingId`.
         pub fn resolve(wparam: usize) -> KeybindingId {
-            KeybindingId(wparam as u32)
+            KeybindingId((wparam as u32).saturating_sub(1))
         }
     }
 
