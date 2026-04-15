@@ -76,6 +76,24 @@ pub trait Window: Send + Sync + 'static {
     ///
     /// Called for fullscreen and minimised windows where no visible border is wanted.
     fn hide_border_overlay(&mut self) -> Result<()> { Ok(()) }
+
+    /// Set window opacity for animation purposes (0 = fully transparent, 255 = opaque).
+    ///
+    /// Backends that support layered windows (Win32 `WS_EX_LAYERED`) override
+    /// this; all others use the provided no-op default.
+    fn set_alpha(&mut self, _alpha: u8) -> Result<()> { Ok(()) }
+
+    /// Remove the opacity override applied by [`set_alpha`] and restore normal
+    /// window rendering.
+    fn clear_alpha(&mut self) -> Result<()> { Ok(()) }
+
+    /// Place this window above all non-topmost windows (`true`) or restore
+    /// normal z-order (`false`).
+    ///
+    /// Must be called when a window enters or leaves floating/fullscreen mode.
+    /// Backends implement this via `SetWindowPos(HWND_TOPMOST / HWND_NOTOPMOST)`;
+    /// the default is a no-op.
+    fn set_topmost(&mut self, _topmost: bool) -> Result<()> { Ok(()) }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

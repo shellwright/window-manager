@@ -25,6 +25,13 @@ pub enum Event {
     /// Either transition triggers a full relayout so other tiles can
     /// expand into / contract out of the freed slot.
     WindowMinimizeChanged { id: WindowId },
+    /// A window's size or position changed externally (not by shellwright).
+    ///
+    /// Fired when `EVENT_OBJECT_LOCATIONCHANGE` detects that a window's
+    /// geometry no longer matches the value shellwright last stored — e.g.
+    /// a browser going into or out of native fullscreen (F11 / YouTube).
+    /// The event loop should respond by re-evaluating borders only (no relayout).
+    WindowSizeChanged { id: WindowId },
     /// A user-configured keybinding fired.
     Keybinding(KeybindingId),
     /// A clean-shutdown request (signal, IPC command, etc.).

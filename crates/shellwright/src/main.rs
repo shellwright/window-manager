@@ -37,7 +37,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run(config: Config, bindings: BindingMap) -> anyhow::Result<()> {
-    let backend = shellwright_windows::WindowsBackend::new(&bindings)?;
+    let float_rules = config.float_rules.clone();
+    let backend = shellwright_windows::WindowsBackend::new(&bindings, float_rules)?;
     event_loop(backend, bindings, config)
 }
 
@@ -161,6 +162,16 @@ fn event_loop<B: Backend>(
                     find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
                 {
                     apply_layout(&mut backend, &workspaces[ws_idx], monitor_rects[mon], &config);
+                    update_borders(&mut backend, &workspaces[ws_idx], &config);
+                }
+            }
+
+            Event::WindowSizeChanged { id } => {
+                // External resize (e.g. browser native fullscreen / exit fullscreen).
+                // Re-evaluate borders only — do not re-tile.
+                if let Some((ws_idx, _)) =
+                    find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
+                {
                     update_borders(&mut backend, &workspaces[ws_idx], &config);
                 }
             }
@@ -299,8 +310,9 @@ fn apply_layout<B: Backend>(
     }
 
     for id in workspace.fullscreen_windows() {
-        let rect = apply_padding(monitor, config.padding);
+        let rect = backend.monitor_full_rect_for_window(id);
         if let Some(w) = backend.window_mut(id) {
+            let _ = w.set_topmost(true);
             if let Err(e) = w.set_geometry(rect) {
                 tracing::warn!(%id, err = %e, "set_geometry (fullscreen) failed");
             }
@@ -366,7 +378,13 @@ fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &C
         let is_full      = workspace.is_fullscreen(id);
         let is_minimized = backend.window_mut(id).map_or(false, |w| w.is_minimized());
 
-        if is_full || is_minimized {
+        // Detect app-native fullscreen (browser F11, game, YouTube fullscreen):
+        // window geometry covers the full monitor rect including taskbar area.
+        let geometry      = backend.window_mut(id).map(|w| w.geometry());
+        let monitor_full  = backend.monitor_full_rect_for_window(id);
+        let is_native_full = geometry.map_or(false, |g| rect_covers(g, monitor_full));
+
+        if is_full || is_minimized || is_native_full {
             if let Some(w) = backend.window_mut(id) {
                 let _ = w.hide_border_overlay();
             }
@@ -379,6 +397,19 @@ fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &C
             let _ = w.set_border_color(color);
         }
     }
+}
+
+/// Returns `true` if `window` fully covers `monitor`.
+///
+/// Uses `<=` / `>=` (not `==`) because `GetWindowRect` includes invisible DWM
+/// resize borders (~8 px on Win10/11), making a maximised window slightly larger
+/// than `rcMonitor`.  Any window that covers the monitor — including ones with
+/// invisible gutters — counts as native-fullscreen.
+fn rect_covers(window: Rect, monitor: Rect) -> bool {
+    window.x <= monitor.x
+        && window.y <= monitor.y
+        && (window.x + window.width  as i32) >= (monitor.x + monitor.width  as i32)
+        && (window.y + window.height as i32) >= (monitor.y + monitor.height as i32)
 }
 
 fn parse_hex_color(s: &str) -> u32 {
@@ -468,6 +499,147 @@ fn json_escape(s: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+// ── Animation helpers ─────────────────────────────────────────────────────────
+
+fn ease_out(t: f32) -> f32 { 1.0 - (1.0 - t).powi(2) }
+
+fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
+    (a as f32 + (b - a) as f32 * t).round() as i32
+}
+
+fn lerp_u32(a: u32, b: u32, t: f32) -> u32 {
+    ((a as f32 + (b as i32 - a as i32) as f32 * t).max(0.0)).round() as u32
+}
+
+fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    Rect::new(
+        lerp_i32(from.x,      to.x,      t),
+        lerp_i32(from.y,      to.y,      t),
+        lerp_u32(from.width,  to.width,  t),
+        lerp_u32(from.height, to.height, t),
+    )
+}
+
+
+/// Like [`apply_layout`] but smoothly interpolates each window from its current
+/// position to the target rect over `duration_ms` using an ease-out curve.
+fn apply_layout_animated<B: Backend>(
+    backend:     &mut B,
+    workspace:   &Workspace,
+    monitor:     Rect,
+    config:      &Config,
+    duration_ms: u32,
+) {
+    let tiled: Vec<WindowId> = workspace
+        .windows()
+        .iter()
+        .copied()
+        .filter(|&id| {
+            !workspace.is_fullscreen(id)
+                && backend.window_mut(id).map_or(false, |w| !w.is_floating() && !w.is_minimized())
+        })
+        .collect();
+
+    let area  = apply_padding(monitor, config.padding);
+    let slots = layout::compute(&workspace.layout, area, tiled.len());
+
+    let from_rects: Vec<Rect> = tiled
+        .iter()
+        .map(|&id| backend.window_mut(id).map(|w| w.geometry()).unwrap_or(area))
+        .collect();
+    let to_rects: Vec<Rect> = tiled
+        .iter()
+        .zip(slots.iter())
+        .map(|(_, s)| inset(s.rect, config.gap))
+        .collect();
+
+    const FRAMES: u32 = 10;
+    let sleep_us = (duration_ms as u64 * 1000) / FRAMES as u64;
+    for frame in 1..=FRAMES {
+        let t = ease_out(frame as f32 / FRAMES as f32);
+        for (i, &id) in tiled.iter().enumerate() {
+            if from_rects[i] == to_rects[i] { continue; }
+            let rect = lerp_rect(from_rects[i], to_rects[i], t);
+            if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(rect); }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+    }
+    // Snap to exact target positions.
+    for (&id, &to) in tiled.iter().zip(to_rects.iter()) {
+        if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(to); }
+    }
+    // Fullscreen windows always snap immediately (use raw monitor bounds).
+    for id in workspace.fullscreen_windows() {
+        let rect = backend.monitor_full_rect_for_window(id);
+        if let Some(w) = backend.window_mut(id) { let _ = w.set_geometry(rect); }
+    }
+}
+
+/// Pre-compute `(id, from_rect, to_rect)` for every tiled window in `workspace`.
+///
+/// Uses immutable access so the caller can collect targets for two workspaces
+/// before starting a combined animation loop.
+fn compute_layout_targets<B: Backend>(
+    backend:   &B,
+    workspace: &Workspace,
+    monitor:   Rect,
+    config:    &Config,
+) -> Vec<(WindowId, Rect, Rect)> {
+    let area  = apply_padding(monitor, config.padding);
+    let wins  = backend.windows();
+
+    let tiled: Vec<WindowId> = workspace
+        .windows()
+        .iter()
+        .copied()
+        .filter(|&id| {
+            !workspace.is_fullscreen(id)
+                && wins.iter().find(|w| w.id() == id)
+                    .map_or(false, |w| !w.is_floating() && !w.is_minimized())
+        })
+        .collect();
+
+    let slots = layout::compute(&workspace.layout, area, tiled.len());
+    tiled
+        .iter()
+        .zip(slots.iter())
+        .map(|(&id, slot)| {
+            let from = wins.iter().find(|w| w.id() == id)
+                .map(|w| w.geometry())
+                .unwrap_or(area);
+            let to = inset(slot.rect, config.gap);
+            (id, from, to)
+        })
+        .collect()
+}
+
+/// Animate windows on *two* monitors simultaneously: each window moves from
+/// `from` to `to` in a single shared ease-out loop, then snaps to exact targets.
+///
+/// `targets` is a flat slice of `(id, from, to)` entries for all windows on
+/// both the source and destination monitors.
+fn animate_all_targets<B: Backend>(
+    backend:     &mut B,
+    targets:     &[(WindowId, Rect, Rect)],
+    duration_ms: u32,
+) {
+    const FRAMES: u32 = 10;
+    let sleep_us = (duration_ms as u64 * 1000) / FRAMES as u64;
+    for frame in 1..=FRAMES {
+        let t = ease_out(frame as f32 / FRAMES as f32);
+        for &(id, from, to) in targets {
+            if from == to { continue; }
+            let rect = lerp_rect(from, to, t);
+            if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(rect); }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+    }
+    // Snap every window to its exact target.
+    for &(id, _, to) in targets {
+        if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(to); }
+    }
 }
 
 // ── Action dispatch ───────────────────────────────────────────────────────────
@@ -576,9 +748,17 @@ fn dispatch<B: Backend>(
                         *focused_mon = right_mon;
                         tracing::info!(%focused, to_ws = %workspaces[target_ws].name, "MoveNext: crossed to right monitor");
                         let src_rect = monitor_rects.get(right_mon - 1).copied().unwrap_or(cur_mon_rect);
-                        apply_layout(backend, &workspaces[cur_ws], src_rect, config);
                         let tgt_rect = monitor_rects.get(right_mon).copied().unwrap_or(cur_mon_rect);
-                        apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
+                        if config.animations.enabled && backend.system_animations_enabled() {
+                            // Compute targets for both monitors while backend is immutably
+                            // accessible, then run one combined loop.
+                            let mut targets = compute_layout_targets(backend, &workspaces[cur_ws], src_rect, config);
+                            targets.extend(compute_layout_targets(backend, &workspaces[target_ws], tgt_rect, config));
+                            animate_all_targets(backend, &targets, config.animations.duration_ms);
+                        } else {
+                            apply_layout(backend, &workspaces[cur_ws], src_rect, config);
+                            apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
+                        }
                         set_global_focus(focused, target_ws, backend, workspaces, monitor_ws, config);
                         if let Some(w) = backend.window_mut(focused) { let _ = w.focus(); }
                     } else {
@@ -591,7 +771,11 @@ fn dispatch<B: Backend>(
                         ) {
                             windows.swap(a, b);
                         }
-                        apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+                        if config.animations.enabled && backend.system_animations_enabled() {
+                            apply_layout_animated(backend, &workspaces[cur_ws], cur_mon_rect, config, config.animations.duration_ms);
+                        } else {
+                            apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+                        }
                         update_borders(backend, &workspaces[cur_ws], config);
                     }
                 }
@@ -621,9 +805,15 @@ fn dispatch<B: Backend>(
                         *focused_mon = left_mon;
                         tracing::info!(%focused, to_ws = %workspaces[target_ws].name, "MovePrev: crossed to left monitor");
                         let src_rect = monitor_rects.get(left_mon + 1).copied().unwrap_or(cur_mon_rect);
-                        apply_layout(backend, &workspaces[cur_ws], src_rect, config);
                         let tgt_rect = monitor_rects.get(left_mon).copied().unwrap_or(cur_mon_rect);
-                        apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
+                        if config.animations.enabled && backend.system_animations_enabled() {
+                            let mut targets = compute_layout_targets(backend, &workspaces[cur_ws], src_rect, config);
+                            targets.extend(compute_layout_targets(backend, &workspaces[target_ws], tgt_rect, config));
+                            animate_all_targets(backend, &targets, config.animations.duration_ms);
+                        } else {
+                            apply_layout(backend, &workspaces[cur_ws], src_rect, config);
+                            apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
+                        }
                         set_global_focus(focused, target_ws, backend, workspaces, monitor_ws, config);
                         if let Some(w) = backend.window_mut(focused) { let _ = w.focus(); }
                     } else {
@@ -636,7 +826,11 @@ fn dispatch<B: Backend>(
                         ) {
                             windows.swap(a, b);
                         }
-                        apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+                        if config.animations.enabled && backend.system_animations_enabled() {
+                            apply_layout_animated(backend, &workspaces[cur_ws], cur_mon_rect, config, config.animations.duration_ms);
+                        } else {
+                            apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+                        }
                         update_borders(backend, &workspaces[cur_ws], config);
                     }
                 }
@@ -666,11 +860,15 @@ fn dispatch<B: Backend>(
         }
 
         Action::ToggleFullscreen => {
+            let fs_rect = workspaces[cur_ws].focused
+                .map(|id| backend.monitor_full_rect_for_window(id))
+                .unwrap_or(cur_mon_rect);
             toggle_fullscreen_for(
                 workspaces[cur_ws].focused,
                 backend,
                 &mut workspaces[cur_ws],
                 cur_mon_rect,
+                fs_rect,
                 config,
             );
         }
@@ -715,37 +913,71 @@ fn dispatch<B: Backend>(
 
             // Hide every window on the outgoing workspace.
             let outgoing: Vec<WindowId> = workspaces[current].windows().to_vec();
-            tracing::info!(
-                ws = %workspaces[current].name,
-                count = outgoing.len(),
-                "hiding outgoing workspace windows"
-            );
-            for id in outgoing {
-                if let Some(w) = backend.window_mut(id) {
-                    let res = w.hide();
-                    tracing::debug!(%id, ?res, "hide");
-                }
-            }
+            let animate = config.animations.enabled && backend.system_animations_enabled();
 
             monitor_ws[mon] = idx;
             *focused_mon = mon;
 
-            // Show and re-tile the incoming workspace.
+            let mr = monitor_rects.get(mon).copied().unwrap_or(cur_mon_rect);
+
+            // Pre-show incoming at alpha=0 so the crossfade can start immediately.
             let incoming: Vec<WindowId> = workspaces[idx].windows().to_vec();
+            if animate {
+                for &id in &incoming {
+                    if let Some(w) = backend.window_mut(id) { let _ = w.set_alpha(0); }
+                }
+            }
             tracing::info!(
                 ws = %workspaces[idx].name,
                 count = incoming.len(),
                 "showing incoming workspace windows"
             );
-            for id in incoming {
+            for &id in &incoming {
                 if let Some(w) = backend.window_mut(id) {
                     let res = w.show();
                     tracing::debug!(%id, ?res, "show");
                 }
             }
-            let mr = monitor_rects.get(mon).copied().unwrap_or(cur_mon_rect);
             apply_layout(backend, &workspaces[idx], mr, config);
             update_borders(backend, &workspaces[idx], config);
+
+            tracing::info!(
+                ws = %workspaces[current].name,
+                count = outgoing.len(),
+                "hiding outgoing workspace windows"
+            );
+
+            // Crossfade: fade outgoing out and incoming in simultaneously.
+            if animate {
+                const FRAMES: u32 = 8;
+                let dur = config.animations.duration_ms;
+                let sleep_us = (dur as u64 * 1000) / FRAMES as u64;
+                for frame in 1..=FRAMES {
+                    let t     = frame as f32 / FRAMES as f32;
+                    let alpha_out = ((1.0 - t) * 255.0) as u8;
+                    let alpha_in  = (t * 255.0) as u8;
+                    for &id in &outgoing {
+                        if let Some(w) = backend.window_mut(id) { let _ = w.set_alpha(alpha_out); }
+                    }
+                    for &id in &incoming {
+                        if let Some(w) = backend.window_mut(id) { let _ = w.set_alpha(alpha_in); }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                }
+            }
+
+            for &id in &outgoing {
+                if let Some(w) = backend.window_mut(id) {
+                    let res = w.hide();
+                    tracing::debug!(%id, ?res, "hide");
+                }
+            }
+            // Clear layered from all: outgoing (hidden, restore for next show) and incoming.
+            if animate {
+                for &id in outgoing.iter().chain(incoming.iter()) {
+                    if let Some(w) = backend.window_mut(id) { let _ = w.clear_alpha(); }
+                }
+            }
 
             // Restore or auto-pick focus.
             if workspaces[idx].focused.is_none() {
@@ -840,6 +1072,7 @@ fn toggle_fullscreen_for<B: Backend>(
     backend: &mut B,
     workspace: &mut Workspace,
     monitor: Rect,
+    fullscreen_rect: Rect,
     config: &Config,
 ) {
     let id = match target {
@@ -850,7 +1083,15 @@ fn toggle_fullscreen_for<B: Backend>(
     if workspace.is_fullscreen(id) {
         workspace.exit_fullscreen(id);
         tracing::info!(%id, "exit fullscreen");
-        apply_layout(backend, workspace, monitor, config);
+        // Demote to topmost only if still floating; otherwise return to normal z-order.
+        if let Some(w) = backend.window_mut(id) {
+            let _ = w.set_topmost(w.is_floating());
+        }
+        if config.animations.enabled && backend.system_animations_enabled() {
+            apply_layout_animated(backend, workspace, monitor, config, config.animations.duration_ms);
+        } else {
+            apply_layout(backend, workspace, monitor, config);
+        }
     } else {
         let saved = backend
             .window_mut(id)
@@ -859,9 +1100,25 @@ fn toggle_fullscreen_for<B: Backend>(
         workspace.enter_fullscreen(id, saved);
         tracing::info!(%id, "enter fullscreen");
 
-        let area = apply_padding(monitor, config.padding);
+        // Animate from current position to fullscreen rect.
+        if config.animations.enabled && backend.system_animations_enabled() {
+            let from = backend.window_mut(id).map(|w| w.geometry()).unwrap_or(fullscreen_rect);
+            if from != fullscreen_rect {
+                const FRAMES: u32 = 10;
+                let sleep_us = (config.animations.duration_ms as u64 * 1000) / FRAMES as u64;
+                for frame in 1..=FRAMES {
+                    let t    = ease_out(frame as f32 / FRAMES as f32);
+                    let rect = lerp_rect(from, fullscreen_rect, t);
+                    if let Some(w) = backend.window_mut(id) { let _ = w.set_geometry(rect); }
+                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                }
+            }
+        }
+
+        // Use raw monitor bounds (rcMonitor) — covers taskbar + external bars.
         if let Some(w) = backend.window_mut(id) {
-            if let Err(e) = w.set_geometry(area) {
+            let _ = w.set_topmost(true);
+            if let Err(e) = w.set_geometry(fullscreen_rect) {
                 tracing::warn!(%id, err = %e, "set_geometry (enter fullscreen) failed");
             }
         }

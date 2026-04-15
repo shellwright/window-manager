@@ -46,6 +46,22 @@ pub trait Backend: Send + 'static {
         self.monitor_rect()
     }
 
+    /// Return the **full** physical bounds of the primary monitor, including the
+    /// taskbar and any external bar reservations.
+    ///
+    /// On Windows this is `MONITORINFO.rcMonitor` (the raw pixel bounds); on
+    /// other platforms the default delegates to [`monitor_rect`].
+    fn monitor_full_rect(&self) -> Rect {
+        self.monitor_rect()
+    }
+
+    /// Return the full physical bounds of the monitor containing `id`.
+    ///
+    /// Defaults to [`monitor_full_rect`] (primary monitor).
+    fn monitor_full_rect_for_window(&self, _id: WindowId) -> Rect {
+        self.monitor_full_rect()
+    }
+
     /// Return the usable tiling areas for **all** connected monitors, sorted
     /// left-to-right by x coordinate.
     ///
@@ -61,4 +77,11 @@ pub trait Backend: Send + 'static {
     /// format.  Called after every workspace-change event.  The default is a
     /// no-op; the Windows backend writes to `\\.\pipe\shellwright`.
     fn broadcast_state(&mut self, _json: &str) {}
+
+    /// Returns `true` if the host system has client-area animations enabled.
+    ///
+    /// On Windows this queries `SPI_GETCLIENTAREAANIMATION`.  The default
+    /// returns `true` (animations allowed) so non-Windows backends inherit the
+    /// config `animations.enabled` flag without an additional system check.
+    fn system_animations_enabled(&self) -> bool { true }
 }

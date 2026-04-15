@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use shellwright_core::{
     backend::Backend,
+    config::FloatRule,
     error::Error,
     event::Event,
     hotkey::BindingMap,
@@ -43,6 +44,7 @@ const SWE_DESTROYED:        usize = 2;
 const SWE_FOCUSED:          usize = 3;
 const SWE_MOVESIZEEND:      usize = 4;
 const SWE_MINIMIZE_CHANGE:  usize = 5; // MINIMIZESTART or MINIMIZEEND
+const SWE_LOCATIONCHANGE:   usize = 6; // EVENT_OBJECT_LOCATIONCHANGE
 
 // ── Border overlay WndProc ────────────────────────────────────────────────────
 
@@ -121,7 +123,7 @@ unsafe fn create_overlay(rect: Rect) -> isize {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, WS_POPUP,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
     use windows::core::PCWSTR;
 
@@ -135,7 +137,7 @@ unsafe fn create_overlay(rect: Rect) -> isize {
     let class_ptr = PCWSTR(atom as usize as *const u16);
 
     let hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         class_ptr,
         PCWSTR::null(),
         WS_POPUP,
@@ -161,30 +163,52 @@ unsafe fn create_overlay(rect: Rect) -> isize {
 /// `border_width` on all sides.  When `radius > 0`, both regions use
 /// `CreateRoundRectRgn` for rounded corners.  After `SetWindowRgn` the OS
 /// owns `outer`; we delete `inner` ourselves.
+///
+/// `app_hwnd` is the managed window the overlay decorates.  Z-order is set so
+/// the overlay is always **above** the app window but **below** floating/fullscreen
+/// windows:
+/// - `topmost = false` (tiled): demote overlay to non-topmost band, then place it
+///   immediately above `app_hwnd` in that band via an explicit insert-after call.
+/// - `topmost = true`  (floating/fullscreen): place overlay in TOPMOST band, then
+///   immediately re-raise `app_hwnd` above it so the app window is on top of its
+///   own ring.
 #[cfg(target_os = "windows")]
-unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32, radius: u32) {
+unsafe fn position_overlay(overlay: isize, app_hwnd: isize, rect: Rect, border_width: u32, radius: u32, topmost: bool) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
         SetWindowRgn, HGDIOBJ, RGN_DIFF,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
     };
 
     if overlay == 0 { return; }
-    let hw = HWND(overlay as *mut _);
+    let hw     = HWND(overlay as *mut _);
+    let app_hw = HWND(app_hwnd as *mut _);
     let bw = border_width as i32;
     let r  = radius as i32;
     let w  = rect.width  as i32;
     let h  = rect.height as i32;
 
-    let _ = SetWindowPos(
-        hw,
-        HWND_TOPMOST,
-        rect.x, rect.y, w, h,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
+    if topmost {
+        // Step 1: place overlay in TOPMOST band at the correct position/size.
+        let _ = SetWindowPos(hw, HWND_TOPMOST, rect.x, rect.y, w, h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Step 2: re-raise the app window above its own overlay so the window
+        //         content is not covered by the ring.
+        let _ = SetWindowPos(app_hw, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        // Step 1: demote overlay out of TOPMOST band and set position/size.
+        let _ = SetWindowPos(hw, HWND_NOTOPMOST, rect.x, rect.y, w, h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Step 2: place overlay immediately above the app window within the
+        //         non-topmost band so the ring is visible over its own window.
+        let _ = SetWindowPos(hw, app_hw, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 
     // Ring = outer - inner.  Use rounded rects when radius > 0.
     let outer = if r > 0 {
@@ -214,6 +238,9 @@ pub struct WindowsWindow {
     title:        String,
     geometry:     Rect,
     floating:     bool,
+    /// `true` while the window is floating **or** fullscreen — drives
+    /// `HWND_TOPMOST` placement for the window and its border overlay.
+    is_topmost:   bool,
     /// Set to `true` when *we* hide the window (workspace switch).
     /// Prevents `SWE_CREATED` from re-adopting our own hidden windows.
     wm_hidden:    bool,
@@ -266,10 +293,10 @@ impl Window for WindowsWindow {
             )
             .map_err(|e| Error::Backend(format!("SetWindowPos: {e}")))?;
 
-            // Keep overlay in sync — use visible bounds expanded by 1 px.
+            // Keep overlay in sync — expand by border_width so full ring protrudes.
             if self.overlay_hwnd != 0 {
-                let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), rect), 1);
-                position_overlay(self.overlay_hwnd, vr, self.border_width, self.border_radius);
+                let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), rect), self.border_width as i32);
+                position_overlay(self.overlay_hwnd, self.hwnd, vr, self.border_width, self.border_radius, self.is_topmost);
             }
         }
         self.geometry = rect;
@@ -280,10 +307,19 @@ impl Window for WindowsWindow {
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
-            let ok = SetForegroundWindow(HWND(self.hwnd as *mut _));
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            let hwnd = HWND(self.hwnd as *mut _);
+            let ok = SetForegroundWindow(hwnd);
             if !ok.as_bool() {
                 tracing::debug!(id = %self.id, "SetForegroundWindow denied");
+            }
+            // Re-assert TOPMOST so focusing doesn't sink a floating/fullscreen window.
+            if self.is_topmost {
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
         Ok(())
@@ -306,7 +342,42 @@ impl Window for WindowsWindow {
     }
 
     fn is_floating(&self) -> bool { self.floating }
-    fn set_floating(&mut self, floating: bool) { self.floating = floating; }
+
+    fn set_floating(&mut self, floating: bool) {
+        self.floating   = floating;
+        self.is_topmost = floating;
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            let insert_after = if floating { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(
+                HWND(self.hwnd as *mut _), insert_after, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn set_topmost(&mut self, topmost: bool) -> Result<()> {
+        self.is_topmost = topmost;
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            let insert_after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(
+                HWND(self.hwnd as *mut _), insert_after, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        Ok(())
+    }
 
     fn is_minimized(&self) -> bool {
         #[cfg(target_os = "windows")]
@@ -384,6 +455,30 @@ impl Window for WindowsWindow {
         Ok(())
     }
 
+    fn set_alpha(&mut self, alpha: u8) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            set_layered_alpha(HWND(self.hwnd as *mut _), alpha)?;
+            if self.overlay_hwnd != 0 {
+                let _ = set_layered_alpha(HWND(self.overlay_hwnd as *mut _), alpha);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_alpha(&mut self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            clear_layered(HWND(self.hwnd as *mut _));
+            if self.overlay_hwnd != 0 {
+                clear_layered(HWND(self.overlay_hwnd as *mut _));
+            }
+        }
+        Ok(())
+    }
+
     fn set_border_overlay(&mut self, rgb: u32, width: u32, radius: u32) -> Result<()> {
         #[cfg(target_os = "windows")]
         unsafe {
@@ -410,9 +505,9 @@ impl Window for WindowsWindow {
             SetWindowLongPtrW(hw, GWLP_USERDATA, colorref as isize);
 
             // Reposition + rebuild ring region using visible bounds, expanded
-            // outward by 1 px so the overlay covers the window's own 1 px chrome.
-            let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), self.geometry), 1);
-            position_overlay(self.overlay_hwnd, vr, width, radius);
+            // outward by border_width so the full ring protrudes past window chrome.
+            let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), self.geometry), self.border_width as i32);
+            position_overlay(self.overlay_hwnd, self.hwnd, vr, width, radius, self.is_topmost);
 
             // Repaint.
             let _ = InvalidateRect(hw, None, false);
@@ -475,6 +570,38 @@ fn rgb_to_colorref(rgb: u32) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
+/// Ensure `hwnd` has `WS_EX_LAYERED` set and apply `alpha` via `LWA_ALPHA`.
+#[cfg(target_os = "windows")]
+unsafe fn set_layered_alpha(
+    hwnd:  windows::Win32::Foundation::HWND,
+    alpha: u8,
+) -> Result<()> {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetLayeredWindowAttributes,
+        GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+    };
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_LAYERED.0 == 0 {
+        SetWindowLongW(hwnd, GWL_EXSTYLE, (ex_style | WS_EX_LAYERED.0) as i32);
+    }
+    SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
+        .map_err(|e| Error::Backend(format!("SetLayeredWindowAttributes: {e}")))?;
+    Ok(())
+}
+
+/// Remove `WS_EX_LAYERED` from `hwnd`, restoring normal (opaque) rendering.
+#[cfg(target_os = "windows")]
+unsafe fn clear_layered(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_LAYERED,
+    };
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_LAYERED.0 != 0 {
+        SetWindowLongW(hwnd, GWL_EXSTYLE, (ex_style & !WS_EX_LAYERED.0) as i32);
+    }
+}
+
 /// Returns `true` if `hwnd` should be managed by shellwright.
 #[cfg(target_os = "windows")]
 unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
@@ -527,11 +654,114 @@ unsafe fn is_manageable(hwnd: windows::Win32::Foundation::HWND) -> bool {
     true
 }
 
+/// Return the Win32 window class name for `hwnd`, or an empty string on failure.
+#[cfg(target_os = "windows")]
+unsafe fn hwnd_class(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut buf) as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// Return the executable filename (e.g. `"steam.exe"`) for the process that
+/// owns `hwnd`.  Returns an empty string if the query fails.
+#[cfg(target_os = "windows")]
+unsafe fn hwnd_exe(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::core::PWSTR;
+
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 { return String::new(); }
+
+    let hproc = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        hproc,
+        PROCESS_NAME_WIN32,
+        PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    ).is_ok();
+    let _ = CloseHandle(hproc);
+
+    if !ok || len == 0 { return String::new(); }
+    let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&full_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Decide whether `hwnd` should start in floating (non-tiled) mode.
+///
+/// # Heuristics (no config required)
+/// 1. Class `#32770` — the Windows system dialog class; covers all common
+///    dialogs, NSIS/Inno Setup installers, MSI dialogs, file-open/save sheets.
+/// 2. `WS_CAPTION` present but both `WS_THICKFRAME` and `WS_MAXIMIZEBOX`
+///    absent — a fixed-size window (properties dialogs, settings panes, etc.).
+///
+/// # User rules
+/// If neither heuristic fires, the caller's `float_rules` list is checked.
+/// A rule matches when every specified field matches (AND logic).
+#[cfg(target_os = "windows")]
+unsafe fn should_float(
+    hwnd:        windows::Win32::Foundation::HWND,
+    title:       &str,
+    float_rules: &[FloatRule],
+) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, GWL_STYLE, WS_CAPTION, WS_MAXIMIZEBOX, WS_THICKFRAME,
+    };
+
+    let class = hwnd_class(hwnd);
+
+    // ── Heuristic 1: system dialog class ────────────────────────────────────
+    if class == "#32770" {
+        tracing::debug!(class, "auto-float: system dialog class");
+        return true;
+    }
+
+    // ── Heuristic 2: fixed-size captioned window ─────────────────────────────
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if style & WS_CAPTION.0 != 0
+        && style & WS_THICKFRAME.0 == 0
+        && style & WS_MAXIMIZEBOX.0 == 0
+    {
+        tracing::debug!(class, style, "auto-float: fixed-size window");
+        return true;
+    }
+
+    // ── User float rules ─────────────────────────────────────────────────────
+    if !float_rules.is_empty() {
+        let exe = hwnd_exe(hwnd);
+        for rule in float_rules {
+            if rule.matches(&class, title, &exe) {
+                tracing::debug!(class, %title, %exe, "auto-float: matched user rule");
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Build a [`WindowsWindow`] from a raw HWND.  Returns `None` on failure.
 #[cfg(target_os = "windows")]
 unsafe fn build_window(
     hwnd: windows::Win32::Foundation::HWND,
     id: WindowId,
+    float_rules: &[FloatRule],
 ) -> Option<WindowsWindow> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -553,13 +783,25 @@ unsafe fn build_window(
         (r.bottom - r.top)  as u32,
     );
 
-    tracing::debug!(%id, %title, ?geometry, "window registered");
+    let floating = should_float(hwnd, &title, float_rules);
+    tracing::debug!(%id, %title, floating, ?geometry, "window registered");
+
+    // Elevate floating windows to TOPMOST immediately on adoption.
+    if floating {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
     Some(WindowsWindow {
         id,
         hwnd: hwnd.0 as isize,
         title,
         geometry,
-        floating:     false,
+        floating,
+        is_topmost:   floating,
         wm_hidden:    false,
         overlay_hwnd:  0,
         border_width:  0,
@@ -587,7 +829,7 @@ unsafe fn refresh_geometry(win: &mut WindowsWindow) {
 // ── Initial window enumeration ────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-fn enumerate_windows(next_id: &mut u64) -> Vec<WindowsWindow> {
+fn enumerate_windows(next_id: &mut u64, float_rules: &[FloatRule]) -> Vec<WindowsWindow> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
@@ -611,13 +853,13 @@ fn enumerate_windows(next_id: &mut u64) -> Vec<WindowsWindow> {
         .filter_map(|hwnd| {
             let id = WindowId(*next_id);
             *next_id += 1;
-            unsafe { build_window(hwnd, id) }
+            unsafe { build_window(hwnd, id, float_rules) }
         })
         .collect()
 }
 
 #[cfg(not(target_os = "windows"))]
-fn enumerate_windows(_next_id: &mut u64) -> Vec<WindowsWindow> { Vec::new() }
+fn enumerate_windows(_next_id: &mut u64, _float_rules: &[FloatRule]) -> Vec<WindowsWindow> { Vec::new() }
 
 // ── WinEvent hook callback ────────────────────────────────────────────────────
 
@@ -640,6 +882,7 @@ unsafe extern "system" fn win_event_proc(
         0x0003 => SWE_FOCUSED,          // EVENT_SYSTEM_FOREGROUND
         0x000B => SWE_MOVESIZEEND,      // EVENT_SYSTEM_MOVESIZEEND
         0x0016 | 0x0017 => SWE_MINIMIZE_CHANGE, // EVENT_SYSTEM_MINIMIZESTART / MINIMIZEEND
+        0x800B => SWE_LOCATIONCHANGE,   // EVENT_OBJECT_LOCATIONCHANGE
         _ => return,
     };
 
@@ -754,17 +997,18 @@ fn spawn_yasb_pipe() -> Option<std::sync::mpsc::SyncSender<String>> {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct WindowsBackend {
-    windows:  Vec<WindowsWindow>,
-    next_id:  u64,
-    _hotkeys: HotkeyManager,
-    _hooks:   HookGuards,
+    windows:     Vec<WindowsWindow>,
+    next_id:     u64,
+    _hotkeys:    HotkeyManager,
+    _hooks:      HookGuards,
     /// Sender end of the channel feeding the YASB named-pipe thread.
     /// `None` when the pipe could not be created (e.g. insufficient perms).
-    yasb_tx:  Option<std::sync::mpsc::SyncSender<String>>,
+    yasb_tx:     Option<std::sync::mpsc::SyncSender<String>>,
+    float_rules: Vec<FloatRule>,
 }
 
 impl WindowsBackend {
-    pub fn new(bindings: &BindingMap) -> Result<Self> {
+    pub fn new(bindings: &BindingMap, float_rules: Vec<FloatRule>) -> Result<Self> {
         tracing::info!("initialising Win32 backend");
 
         let hotkeys = HotkeyManager::register(bindings)?;
@@ -799,6 +1043,10 @@ impl WindowsBackend {
                     SetWinEventHook(0x000B, 0x000B, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                     // Minimize start + minimize end (restore) — both trigger relayout.
                     SetWinEventHook(0x0016, 0x0017, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
+                    // Location/size change — detects app-native fullscreen (browser F11, games).
+                    // WINEVENT_SKIPOWNPROCESS (bit 1 of flags) prevents our own SetWindowPos
+                    // from triggering this; only external size changes reach us.
+                    SetWinEventHook(0x800B, 0x800B, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                 ]
             };
             for &h in &hook_handles {
@@ -812,12 +1060,12 @@ impl WindowsBackend {
         #[cfg(not(target_os = "windows"))]
         let (mut next_id, hooks) = (1u64, HookGuards(vec![]));
 
-        let windows = enumerate_windows(&mut next_id);
+        let windows = enumerate_windows(&mut next_id, &float_rules);
         tracing::info!(count = windows.len(), "initial window list");
 
         let yasb_tx = spawn_yasb_pipe();
 
-        Ok(Self { windows, next_id, _hotkeys: hotkeys, _hooks: hooks, yasb_tx })
+        Ok(Self { windows, next_id, _hotkeys: hotkeys, _hooks: hooks, yasb_tx, float_rules })
     }
 }
 
@@ -892,7 +1140,7 @@ impl Backend for WindowsBackend {
                                 if unsafe { is_manageable(hwnd) } {
                                     let id = WindowId(self.next_id);
                                     self.next_id += 1;
-                                    if let Some(win) = unsafe { build_window(hwnd, id) } {
+                                    if let Some(win) = unsafe { build_window(hwnd, id, &self.float_rules) } {
                                         let win_id = win.id;
                                         self.windows.push(win);
                                         return Ok(Event::WindowCreated(win_id));
@@ -919,7 +1167,7 @@ impl Backend for WindowsBackend {
                                 if unsafe { is_manageable(hwnd) } {
                                     let id = WindowId(self.next_id);
                                     self.next_id += 1;
-                                    if let Some(win) = unsafe { build_window(hwnd, id) } {
+                                    if let Some(win) = unsafe { build_window(hwnd, id, &self.float_rules) } {
                                         let win_id = win.id;
                                         self.windows.push(win);
                                         tracing::debug!(%win_id, "adopted focused window");
@@ -942,6 +1190,37 @@ impl Backend for WindowsBackend {
                                     let id = w.id;
                                     tracing::debug!(%id, "minimize state changed");
                                     return Ok(Event::WindowMinimizeChanged { id });
+                                }
+                            }
+
+                            SWE_LOCATIONCHANGE => {
+                                // Only process tracked windows that are not hidden by us.
+                                if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val && !w.wm_hidden) {
+                                    use windows::Win32::Foundation::RECT;
+                                    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+                                    let mut r = RECT::default();
+                                    let ok = unsafe { GetWindowRect(hwnd, &mut r).is_ok() };
+                                    if ok {
+                                        let new_w = (r.right  - r.left).unsigned_abs();
+                                        let new_h = (r.bottom - r.top).unsigned_abs();
+                                        let stored = self.windows[pos].geometry;
+                                        // Emit only when size change is larger than the invisible
+                                        // DWM resize gutter (~8 px); avoids false positives from
+                                        // our own moves or minor DWM adjustments.
+                                        let dw = (new_w as i32 - stored.width  as i32).unsigned_abs();
+                                        let dh = (new_h as i32 - stored.height as i32).unsigned_abs();
+                                        if dw > 16 || dh > 16 {
+                                            self.windows[pos].geometry = Rect::new(
+                                                r.left,
+                                                r.top,
+                                                new_w,
+                                                new_h,
+                                            );
+                                            let id = self.windows[pos].id;
+                                            tracing::debug!(%id, dw, dh, "external size change detected");
+                                            return Ok(Event::WindowSizeChanged { id });
+                                        }
+                                    }
                                 }
                             }
 
@@ -1081,5 +1360,84 @@ impl Backend for WindowsBackend {
         if let Some(ref tx) = self.yasb_tx {
             let _ = tx.try_send(json.to_owned());
         }
+    }
+
+    fn system_animations_enabled(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+            };
+            let mut enabled: u32 = 1;
+            unsafe {
+                let _ = SystemParametersInfoW(
+                    SPI_GETCLIENTAREAANIMATION,
+                    0,
+                    Some(std::ptr::addr_of_mut!(enabled).cast()),
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                );
+            }
+            enabled != 0
+        }
+        #[cfg(not(target_os = "windows"))]
+        true
+    }
+
+    fn monitor_full_rect(&self) -> Rect {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::Graphics::Gdi::{
+                GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+            };
+            unsafe {
+                let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                let mut info: MONITORINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                    let r = info.rcMonitor;
+                    return Rect::new(
+                        r.left,
+                        r.top,
+                        (r.right  - r.left) as u32,
+                        (r.bottom - r.top)  as u32,
+                    );
+                }
+            }
+            self.monitor_rect()
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.monitor_rect()
+    }
+
+    fn monitor_full_rect_for_window(&self, id: WindowId) -> Rect {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::Graphics::Gdi::{
+                GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            };
+            if let Some(win) = self.windows.iter().find(|w| w.id() == id) {
+                let hwnd = HWND(win.hwnd as *mut _);
+                unsafe {
+                    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut info: MONITORINFO = std::mem::zeroed();
+                    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                    if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                        let r = info.rcMonitor;
+                        return Rect::new(
+                            r.left,
+                            r.top,
+                            (r.right  - r.left) as u32,
+                            (r.bottom - r.top)  as u32,
+                        );
+                    }
+                }
+            }
+            self.monitor_full_rect()
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.monitor_full_rect()
     }
 }

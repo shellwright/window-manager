@@ -24,6 +24,62 @@ pub struct Padding {
     pub right: u32,
 }
 
+/// Animation settings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnimationConfig {
+    /// Master switch — `false` disables all motion effects regardless of the
+    /// Windows system animation preference.
+    pub enabled: bool,
+    /// Total animation duration in milliseconds.  Applies to both workspace
+    /// fades and window-move interpolation.
+    pub duration_ms: u32,
+}
+
+impl Default for AnimationConfig {
+    fn default() -> Self {
+        Self { enabled: true, duration_ms: 200 }
+    }
+}
+
+/// A rule that causes matching windows to start in floating (non-tiled) mode.
+///
+/// All specified fields must match (AND logic); omitted fields are wildcards.
+///
+/// # Examples (config.toml)
+/// ```toml
+/// [[float_rules]]
+/// exe = "steam.exe"
+///
+/// [[float_rules]]
+/// class = "TaskManagerWindow"
+///
+/// [[float_rules]]
+/// title_contains = "Properties"
+/// exe = "explorer.exe"
+/// ```
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct FloatRule {
+    /// Exact window class name (case-insensitive), e.g. `"#32770"`.
+    pub class: Option<String>,
+    /// Title must contain this substring (case-insensitive).
+    pub title_contains: Option<String>,
+    /// Process executable filename (case-insensitive), e.g. `"steam.exe"`.
+    pub exe: Option<String>,
+}
+
+impl FloatRule {
+    /// Returns `true` if this rule matches the given window attributes.
+    pub fn matches(&self, class: &str, title: &str, exe: &str) -> bool {
+        self.class.as_deref().map_or(true, |c| class.eq_ignore_ascii_case(c))
+            && self.title_contains.as_deref().map_or(true, |t| {
+                title.to_lowercase().contains(&t.to_lowercase())
+            })
+            && self.exe.as_deref().map_or(true, |e| exe.eq_ignore_ascii_case(e))
+    }
+}
+
 /// Top-level configuration loaded from `config.toml`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,13 +100,22 @@ pub struct Config {
     pub workspaces: Vec<WorkspaceConfig>,
     pub keybindings: Vec<Keybinding>,
     pub default_layout: LayoutKind,
+    /// Animation configuration (fades, window-move easing).
+    pub animations: AnimationConfig,
+    /// Windows matching any of these rules start in floating (non-tiled) mode.
+    ///
+    /// In addition, Shellwright automatically floats windows that Win32 marks as
+    /// dialogs: the `#32770` system dialog class and any fixed-size window
+    /// (caption present, no resize handle, no maximise button) are floated
+    /// without needing a rule here.
+    pub float_rules: Vec<FloatRule>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             gap: 8,
-            border_width: 4,
+            border_width: 5,
             border_active:   "#5E81AC".into(), // Nord blue
             border_inactive: "#3B4252".into(), // Nord dark
             border_radius:   8,
@@ -58,6 +123,8 @@ impl Default for Config {
             workspaces: (1..=9).map(|i| WorkspaceConfig { name: i.to_string() }).collect(),
             keybindings: default_keybindings(),
             default_layout: LayoutKind::default(),
+            animations: AnimationConfig::default(),
+            float_rules: Vec::new(),
         }
     }
 }
