@@ -37,6 +37,8 @@ pub struct Config {
     pub border_active: String,
     /// Border colour for all unfocused windows (hex `#RRGGBB`).
     pub border_inactive: String,
+    /// Border corner radius in physical pixels (0 = square corners).
+    pub border_radius: u32,
     /// Screen-edge padding to reserve for external bars (e.g. YASB).
     pub padding: Padding,
     pub workspaces: Vec<WorkspaceConfig>,
@@ -51,6 +53,7 @@ impl Default for Config {
             border_width: 4,
             border_active:   "#5E81AC".into(), // Nord blue
             border_inactive: "#3B4252".into(), // Nord dark
+            border_radius:   8,
             padding: Padding::default(),
             workspaces: (1..=9).map(|i| WorkspaceConfig { name: i.to_string() }).collect(),
             keybindings: default_keybindings(),

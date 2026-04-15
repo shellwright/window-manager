@@ -45,4 +45,20 @@ pub trait Backend: Send + 'static {
     fn monitor_rect_for_window(&self, _id: WindowId) -> Rect {
         self.monitor_rect()
     }
+
+    /// Return the usable tiling areas for **all** connected monitors, sorted
+    /// left-to-right by x coordinate.
+    ///
+    /// Used to assign each monitor its own workspace slice.  The default
+    /// returns a single-element vec with the primary monitor rect.
+    fn monitor_rects(&self) -> Vec<Rect> {
+        vec![self.monitor_rect()]
+    }
+
+    /// Broadcast workspace state to any connected status-bar IPC clients.
+    ///
+    /// `json` is a UTF-8 string terminated with `\n` in komorebi-compatible
+    /// format.  Called after every workspace-change event.  The default is a
+    /// no-op; the Windows backend writes to `\\.\pipe\shellwright`.
+    fn broadcast_state(&mut self, _json: &str) {}
 }

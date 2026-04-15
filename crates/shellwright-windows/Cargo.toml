@@ -19,8 +19,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Com",
-    "Win32_System_Threading",   # GetCurrentThreadId
-    "Win32_Graphics_Dwm",       # DwmSetWindowAttribute (border colour, Win11+)
-    "Win32_Graphics_Gdi",       # MonitorFromWindow / GetMonitorInfoW / GDI overlay borders
-    "Win32_System_LibraryLoader", # GetModuleHandleW (HINSTANCE for RegisterClassExW)
+    "Win32_System_Threading",      # GetCurrentThreadId
+    "Win32_Graphics_Dwm",          # DwmSetWindowAttribute (border colour, Win11+)
+    "Win32_Graphics_Gdi",          # MonitorFromWindow / GetMonitorInfoW / EnumDisplayMonitors
+    "Win32_System_LibraryLoader",  # GetModuleHandleW (HINSTANCE for RegisterClassExW)
+    "Win32_System_Pipes",          # DisconnectNamedPipe / NAMED_PIPE_MODE (YASB IPC)
+    "Win32_System_IO",             # ConnectNamedPipe / WriteFile (YASB IPC)
+    "Win32_Security",              # CreateNamedPipeW requires this
+    "Win32_Storage_FileSystem",    # FILE_FLAGS_AND_ATTRIBUTES / CreateNamedPipeW (YASB IPC)
 ] }

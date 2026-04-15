@@ -1,16 +1,23 @@
-//! Win32 global hotkey registration via `RegisterHotKey`.
+//! Win32 global hotkey detection via `WH_KEYBOARD_LL`.
 //!
-//! # How it works
-//! `RegisterHotKey` posts `WM_HOTKEY` messages to the calling thread's message
-//! queue whenever a registered combo is pressed system-wide.  The backend's
-//! `GetMessage` loop picks them up and converts them to
-//! [`shellwright_core::event::Event::Keybinding`].
+//! # Strategy
+//! A low-level keyboard hook (`WH_KEYBOARD_LL`) is installed on the main
+//! thread.  The hook procedure is invoked *inside* `GetMessageW` whenever
+//! any key is pressed system-wide.  When a configured binding matches, the
+//! proc posts `WM_KBD_HOTKEY` to the thread queue and returns `LRESULT(1)`
+//! to consume the key (preventing it from reaching the focused app).
 //!
-//! # Limitations
-//! - `RegisterHotKey` cannot capture keys that another application has already
-//!   exclusively registered (rare in practice).
-//! - Hotkeys are per-thread; `HotkeyManager` must be created and used on the
-//!   same thread as the message loop.
+//! Unlike `RegisterHotKey` this is not blocked by:
+//! - Alt-key menu activation
+//! - UAC elevation mismatches between shellwright and the foreground window
+//! - Other applications holding a global `RegisterHotKey` claim
+//!
+//! # Threading
+//! The hook proc runs on the thread that installed the hook, called
+//! re-entrantly from within `GetMessageW`.  No locks are held during the
+//! proc; the binding table is write-once / read-many via `OnceLock`.
+
+use std::sync::OnceLock;
 
 use shellwright_core::{
     error::Error,
@@ -19,97 +26,169 @@ use shellwright_core::{
     Result,
 };
 
+/// Thread-message ID posted to the main queue when a binding fires.
+/// `WM_USER + 2` = `0x0402`.  Does not conflict with `WM_SWE` (`0x0401`).
+pub const WM_KBD_HOTKEY: u32 = 0x0402;
+
 // ── Platform implementation ───────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
-        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+        GetAsyncKeyState,
+        VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx,
+        HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
     };
 
+    // Internal modifier bitmask (not Win32 HOT_KEY_MODIFIERS).
+    const M_ALT:   u32 = 0x01;
+    const M_CTRL:  u32 = 0x02;
+    const M_SHIFT: u32 = 0x04;
+    const M_SUPER: u32 = 0x08;
+
+    /// Binding table: `(KeybindingId.0, vk, required_mods_bitmask)`.
+    /// Written once at startup; read-only from the hook proc.
+    static BINDINGS: OnceLock<Vec<(u32, u16, u32)>> = OnceLock::new();
+    /// Thread ID of the message-pump thread (set before hook install).
+    static HOOK_TID: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "system" fn ll_hook_proc(
+        code:   i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            let is_down = matches!(
+                wparam.0 as u32,
+                WM_KEYDOWN | WM_SYSKEYDOWN
+            );
+            if is_down {
+                let kb  = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                let vk  = kb.vkCode as u16;
+
+                // Build modifier bitmask from async key state.
+                // Cast to u16 first so the sign bit test is well-defined.
+                let down = |k: i32| (GetAsyncKeyState(k) as u16) & 0x8000 != 0;
+                let mods: u32 =
+                    if down(VK_MENU.0 as i32)    { M_ALT   } else { 0 } |
+                    if down(VK_CONTROL.0 as i32)  { M_CTRL  } else { 0 } |
+                    if down(VK_SHIFT.0 as i32)    { M_SHIFT } else { 0 } |
+                    if down(VK_LWIN.0 as i32)
+                    || down(VK_RWIN.0 as i32)     { M_SUPER } else { 0 };
+
+                if let Some(bindings) = BINDINGS.get() {
+                    for &(id, bvk, bmods) in bindings {
+                        if vk == bvk && mods == bmods {
+                            let tid = HOOK_TID.load(Ordering::Relaxed);
+                            if tid != 0 {
+                                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+                                let _ = PostThreadMessageW(
+                                    tid,
+                                    super::WM_KBD_HOTKEY,
+                                    WPARAM(id as usize),
+                                    LPARAM(0),
+                                );
+                            }
+                            // Consume: do not pass to the focused application.
+                            return LRESULT(1);
+                        }
+                    }
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
     pub struct HotkeyManager {
-        registered_ids: Vec<i32>,
+        hook: isize,
     }
 
     impl HotkeyManager {
         pub fn register(map: &BindingMap) -> Result<Self> {
-            let mut registered_ids = Vec::new();
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+
+            // Store TID so the hook proc can post to our queue.
+            let tid = unsafe { GetCurrentThreadId() };
+            HOOK_TID.store(tid, Ordering::Relaxed);
+
+            // Build binding table.
+            let mut entries: Vec<(u32, u16, u32)> = Vec::new();
             let mut skipped = 0u32;
 
             for (id, combo, _action) in map.iter() {
                 let vk = match key_to_vk(&combo.key) {
-                    Ok(v) => v,
+                    Ok(v)  => v,
                     Err(e) => {
-                        tracing::warn!(key = %combo.key.0, err = %e, "skipping hotkey — unknown key name");
+                        tracing::warn!(key = %combo.key.0, err = %e, "binding skipped — unknown key");
                         skipped += 1;
                         continue;
                     }
                 };
-                let mods = mods_to_win32(combo.modifiers) | MOD_NOREPEAT;
-                // Use id+1 so the first binding gets win_id=1, never 0.
-                // (Some Win32 internals treat hotkey-id 0 specially.)
-                let win_id = (id.0 + 1) as i32;
-
-                match unsafe { RegisterHotKey(None, win_id, mods, vk as u32) } {
-                    Ok(_) => {
-                        tracing::debug!(id = win_id, key = %combo.key.0, "registered hotkey");
-                        registered_ids.push(win_id);
-                    }
-                    Err(_) => {
-                        // Soft-fail: many Super+key combos are reserved by Windows
-                        // (e.g. Win+H = Voice Typing on Win11).  Log and continue.
-                        tracing::warn!(
-                            id = win_id,
-                            key = %combo.key.0,
-                            "hotkey already claimed by system/another app — skipping"
-                        );
-                        skipped += 1;
-                    }
-                }
+                let mods = mods_to_bits(combo.modifiers);
+                tracing::info!(
+                    id = id.0,
+                    key = %combo.key.0,
+                    mods,
+                    vk,
+                    "hotkey binding registered"
+                );
+                entries.push((id.0, vk, mods));
             }
 
             if skipped > 0 {
-                tracing::warn!(
-                    skipped,
-                    registered = registered_ids.len(),
-                    "some hotkeys could not be registered (claimed by OS or another app)"
-                );
+                tracing::warn!(skipped, "some bindings skipped — unknown key names");
             }
 
-            Ok(Self { registered_ids })
+            // OnceLock write — safe to ignore error if somehow called twice.
+            let _ = BINDINGS.set(entries);
+
+            // Install the low-level keyboard hook on the current thread.
+            let hmod = unsafe { GetModuleHandleW(None).unwrap_or_default() };
+            let hook = unsafe {
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_hook_proc), hmod, 0)
+                    .map_err(|e| Error::Backend(format!("SetWindowsHookExW: {e}")))?
+            };
+
+            tracing::info!("WH_KEYBOARD_LL hook installed");
+            Ok(Self { hook: hook.0 as isize })
         }
 
-        /// Called by the message loop when `WM_HOTKEY` arrives.
-        /// The `wparam` of `WM_HOTKEY` is the id passed to `RegisterHotKey`.
-        /// We register with `id.0 + 1`, so subtract 1 to recover the `KeybindingId`.
+        /// Recover `KeybindingId` from the `wparam` of `WM_KBD_HOTKEY`.
+        /// The hook proc posts `id.0` directly, so no adjustment needed.
         pub fn resolve(wparam: usize) -> KeybindingId {
-            KeybindingId((wparam as u32).saturating_sub(1))
+            KeybindingId(wparam as u32)
         }
     }
 
     impl Drop for HotkeyManager {
         fn drop(&mut self) {
-            for id in &self.registered_ids {
-                let _ = unsafe { UnregisterHotKey(None, *id) };
+            if self.hook != 0 {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(HHOOK(self.hook as *mut _));
+                }
+                tracing::debug!("WH_KEYBOARD_LL hook removed");
             }
         }
     }
 
-    fn mods_to_win32(m: Modifiers) -> HOT_KEY_MODIFIERS {
-        let mut out = HOT_KEY_MODIFIERS(0);
-        if m.contains(Modifiers::ALT)   { out |= MOD_ALT; }
-        if m.contains(Modifiers::CTRL)  { out |= MOD_CONTROL; }
-        if m.contains(Modifiers::SHIFT) { out |= MOD_SHIFT; }
-        if m.contains(Modifiers::SUPER) { out |= MOD_WIN; }
+    fn mods_to_bits(m: Modifiers) -> u32 {
+        let mut out = 0u32;
+        if m.contains(Modifiers::ALT)   { out |= M_ALT; }
+        if m.contains(Modifiers::CTRL)  { out |= M_CTRL; }
+        if m.contains(Modifiers::SHIFT) { out |= M_SHIFT; }
+        if m.contains(Modifiers::SUPER) { out |= M_SUPER; }
         out
     }
 
-    /// Map a [`Key`] name to a Win32 virtual-key code (u16).
-    ///
-    /// Covers letters, digits, F-keys, navigation, and common symbols.
-    /// Returns `Err` for keys not (yet) in the table.
+    /// Map a [`Key`] name to a Win32 virtual-key code.
     fn key_to_vk(key: &Key) -> Result<u16> {
         let s = key.0.as_str();
 
@@ -119,7 +198,6 @@ mod platform {
             if c.is_ascii_alphabetic() {
                 return Ok(c.to_ascii_uppercase() as u16);
             }
-            // Single digit → VK_0..VK_9 (0x30–0x39)
             if c.is_ascii_digit() {
                 return Ok(c as u16);
             }
@@ -155,18 +233,18 @@ mod platform {
             "minus"            => 0xBD, // VK_OEM_MINUS
             "period"           => 0xBE, // VK_OEM_PERIOD
             "slash"            => 0xBF, // VK_OEM_2
-            "grave"            => 0xC0, // VK_OEM_3  (`/~)
+            "grave"            => 0xC0, // VK_OEM_3 (`/~)
             "bracketleft"      => 0xDB, // VK_OEM_4
             "backslash"        => 0xDC, // VK_OEM_5
             "bracketright"     => 0xDD, // VK_OEM_6
             "apostrophe"       => 0xDE, // VK_OEM_7
-            other => return Err(Error::Config(format!("unsupported key name: {other}"))),
+            other => return Err(Error::Config(format!("unsupported key: {other}"))),
         };
         Ok(vk)
     }
 }
 
-// ── Stub for non-Windows builds (allows the crate to compile everywhere) ──────
+// ── Stub for non-Windows builds ───────────────────────────────────────────────
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
@@ -175,12 +253,8 @@ mod platform {
     pub struct HotkeyManager;
 
     impl HotkeyManager {
-        pub fn register(_map: &BindingMap) -> Result<Self> {
-            Ok(Self)
-        }
-        pub fn resolve(wparam: usize) -> KeybindingId {
-            KeybindingId(wparam as u32)
-        }
+        pub fn register(_map: &BindingMap) -> Result<Self> { Ok(Self) }
+        pub fn resolve(wparam: usize) -> KeybindingId { KeybindingId(wparam as u32) }
     }
 }
 

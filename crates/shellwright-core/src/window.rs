@@ -70,7 +70,7 @@ pub trait Window: Send + Sync + 'static {
     /// `rgb` is `0x00RRGGBB`; `width` is the border thickness in physical pixels.
     /// Backends that implement overlay borders (Windows via `SetWindowRgn`) override
     /// this; all others use the provided no-op default.
-    fn set_border_overlay(&mut self, _rgb: u32, _width: u32) -> Result<()> { Ok(()) }
+    fn set_border_overlay(&mut self, _rgb: u32, _width: u32, _radius: u32) -> Result<()> { Ok(()) }
 
     /// Hide the border overlay without destroying it.
     ///

@@ -158,13 +158,15 @@ unsafe fn create_overlay(rect: Rect) -> isize {
 /// Reposition the overlay and rebuild its hollow ring region.
 ///
 /// The ring region is: full window rect **minus** the inner rect inset by
-/// `border_width` on all sides.  After `SetWindowRgn` the OS owns `outer`;
-/// we delete `inner` ourselves.
+/// `border_width` on all sides.  When `radius > 0`, both regions use
+/// `CreateRoundRectRgn` for rounded corners.  After `SetWindowRgn` the OS
+/// owns `outer`; we delete `inner` ourselves.
 #[cfg(target_os = "windows")]
-unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32) {
+unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32, radius: u32) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
-        CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ, RGN_DIFF,
+        CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject,
+        SetWindowRgn, HGDIOBJ, RGN_DIFF,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
@@ -173,6 +175,7 @@ unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32) {
     if overlay == 0 { return; }
     let hw = HWND(overlay as *mut _);
     let bw = border_width as i32;
+    let r  = radius as i32;
     let w  = rect.width  as i32;
     let h  = rect.height as i32;
 
@@ -183,9 +186,19 @@ unsafe fn position_overlay(overlay: isize, rect: Rect, border_width: u32) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
 
-    // Ring = outer - inner
-    let outer = CreateRectRgn(0, 0, w, h);
-    let inner = CreateRectRgn(bw, bw, (w - bw).max(0), (h - bw).max(0));
+    // Ring = outer - inner.  Use rounded rects when radius > 0.
+    let outer = if r > 0 {
+        CreateRoundRectRgn(0, 0, w, h, r * 2, r * 2)
+    } else {
+        CreateRectRgn(0, 0, w, h)
+    };
+    // Inner radius shrinks by border_width; floor at 0 to avoid negative.
+    let inner_r = (r - bw).max(0);
+    let inner = if inner_r > 0 {
+        CreateRoundRectRgn(bw, bw, (w - bw).max(bw + 1), (h - bw).max(bw + 1), inner_r * 2, inner_r * 2)
+    } else {
+        CreateRectRgn(bw, bw, (w - bw).max(bw + 1), (h - bw).max(bw + 1))
+    };
     CombineRgn(outer, outer, inner, RGN_DIFF);
     // OS takes ownership of `outer` after SetWindowRgn.
     SetWindowRgn(hw, outer, true);
@@ -208,6 +221,8 @@ pub struct WindowsWindow {
     overlay_hwnd: isize,
     /// Last border width used for the overlay ring region (pixels).
     border_width: u32,
+    /// Border corner radius in pixels (0 = square corners).
+    border_radius: u32,
 }
 
 impl Drop for WindowsWindow {
@@ -251,9 +266,10 @@ impl Window for WindowsWindow {
             )
             .map_err(|e| Error::Backend(format!("SetWindowPos: {e}")))?;
 
-            // Keep overlay in sync.
+            // Keep overlay in sync — use visible bounds expanded by 1 px.
             if self.overlay_hwnd != 0 {
-                position_overlay(self.overlay_hwnd, rect, self.border_width);
+                let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), rect), 1);
+                position_overlay(self.overlay_hwnd, vr, self.border_width, self.border_radius);
             }
         }
         self.geometry = rect;
@@ -304,12 +320,14 @@ impl Window for WindowsWindow {
     }
 
     fn hide(&mut self) -> Result<()> {
+        tracing::debug!(id = %self.id, hwnd = self.hwnd, "hide: SW_HIDE");
         self.wm_hidden = true;
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-            let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_HIDE);
+            let r = ShowWindow(HWND(self.hwnd as *mut _), SW_HIDE);
+            tracing::debug!(id = %self.id, result = ?r, "ShowWindow(SW_HIDE)");
             // Hide overlay too.
             if self.overlay_hwnd != 0 {
                 let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_HIDE);
@@ -319,12 +337,14 @@ impl Window for WindowsWindow {
     }
 
     fn show(&mut self) -> Result<()> {
+        tracing::debug!(id = %self.id, hwnd = self.hwnd, "show: SW_SHOWNA");
         self.wm_hidden = false;
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
-            let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_SHOWNA);
+            let r = ShowWindow(HWND(self.hwnd as *mut _), SW_SHOWNA);
+            tracing::debug!(id = %self.id, result = ?r, "ShowWindow(SW_SHOWNA)");
             // Show overlay too.
             if self.overlay_hwnd != 0 {
                 let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_SHOWNA);
@@ -364,7 +384,7 @@ impl Window for WindowsWindow {
         Ok(())
     }
 
-    fn set_border_overlay(&mut self, rgb: u32, width: u32) -> Result<()> {
+    fn set_border_overlay(&mut self, rgb: u32, width: u32, radius: u32) -> Result<()> {
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::Win32::Foundation::HWND;
@@ -372,7 +392,8 @@ impl Window for WindowsWindow {
             use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
 
             let colorref = rgb_to_colorref(rgb);
-            self.border_width = width;
+            self.border_width  = width;
+            self.border_radius = radius;
 
             // Create overlay on first call.
             if self.overlay_hwnd == 0 {
@@ -388,8 +409,10 @@ impl Window for WindowsWindow {
             // Store colour for WM_PAINT.
             SetWindowLongPtrW(hw, GWLP_USERDATA, colorref as isize);
 
-            // Reposition + rebuild ring region.
-            position_overlay(self.overlay_hwnd, self.geometry, width);
+            // Reposition + rebuild ring region using visible bounds, expanded
+            // outward by 1 px so the overlay covers the window's own 1 px chrome.
+            let vr = expand_rect(visible_rect(HWND(self.hwnd as *mut _), self.geometry), 1);
+            position_overlay(self.overlay_hwnd, vr, width, radius);
 
             // Repaint.
             let _ = InvalidateRect(hw, None, false);
@@ -399,6 +422,49 @@ impl Window for WindowsWindow {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the *visible* window rect via `DWMWA_EXTENDED_FRAME_BOUNDS`.
+///
+/// On Windows 10/11 every window has an invisible resize border (~8 px on
+/// left/right/bottom).  `GetWindowRect` includes that dead zone; this function
+/// returns only the visually rendered area.  Falls back to the geometry stored
+/// in `win` when DWM fails (e.g. on minimised or non-DWM windows).
+#[cfg(target_os = "windows")]
+unsafe fn visible_rect(hwnd: windows::Win32::Foundation::HWND, fallback: Rect) -> Rect {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWINDOWATTRIBUTE};
+
+    let mut frame = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWINDOWATTRIBUTE(9), // DWMWA_EXTENDED_FRAME_BOUNDS
+        &mut frame as *mut RECT as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_ok()
+        && (frame.right - frame.left) > 0
+        && (frame.bottom - frame.top) > 0
+    {
+        Rect::new(
+            frame.left,
+            frame.top,
+            (frame.right  - frame.left) as u32,
+            (frame.bottom - frame.top)  as u32,
+        )
+    } else {
+        fallback
+    }
+}
+
+/// Expand a rect outward by `px` pixels on every side.
+fn expand_rect(r: Rect, px: i32) -> Rect {
+    Rect::new(
+        r.x - px,
+        r.y - px,
+        (r.width  as i32 + px * 2).max(0) as u32,
+        (r.height as i32 + px * 2).max(0) as u32,
+    )
+}
 
 /// Convert `0x00RRGGBB` to Win32 `COLORREF` (`0x00BBGGRR`).
 #[cfg(target_os = "windows")]
@@ -495,8 +561,9 @@ unsafe fn build_window(
         geometry,
         floating:     false,
         wm_hidden:    false,
-        overlay_hwnd: 0,
-        border_width: 0,
+        overlay_hwnd:  0,
+        border_width:  0,
+        border_radius: 0,
     })
 }
 
@@ -603,6 +670,87 @@ impl Drop for HookGuards {
     }
 }
 
+// ── YASB named-pipe server ────────────────────────────────────────────────────
+
+/// Spawn the YASB named-pipe server thread.
+///
+/// Creates `\\.\pipe\shellwright` and blocks until a client connects.  For each
+/// JSON line pushed via the returned `SyncSender`, it calls `WriteFile`.  When
+/// the client disconnects the thread re-creates the pipe and waits for the next
+/// connection.  Returns `None` if the thread could not be spawned.
+fn spawn_yasb_pipe() -> Option<std::sync::mpsc::SyncSender<String>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(4);
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WriteFile};
+        use windows::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
+        };
+        use windows::core::PCWSTR;
+
+        let ok = std::thread::Builder::new()
+            .name("shellwright-yasb".into())
+            .spawn(move || {
+                let name: Vec<u16> = "\\\\.\\pipe\\shellwright\0".encode_utf16().collect();
+                loop {
+                    let pipe: HANDLE = unsafe {
+                        CreateNamedPipeW(
+                            PCWSTR(name.as_ptr()),
+                            FILE_FLAGS_AND_ATTRIBUTES(0x0000_0002), // PIPE_ACCESS_OUTBOUND
+                            NAMED_PIPE_MODE(0x0000_0000),           // PIPE_TYPE_BYTE | PIPE_WAIT
+                            255,   // PIPE_UNLIMITED_INSTANCES
+                            65536, // outbound buffer
+                            0,     // inbound buffer
+                            0,     // default timeout
+                            None,
+                        )
+                    };
+                    if pipe == INVALID_HANDLE_VALUE {
+                        tracing::warn!("CreateNamedPipeW failed — YASB IPC unavailable");
+                        break;
+                    }
+                    tracing::debug!("YASB pipe created, waiting for client");
+
+                    // Block until a client connects.
+                    let _ = unsafe { ConnectNamedPipe(pipe, None) };
+                    tracing::debug!("YASB client connected");
+
+                    // Drain channel messages until WriteFile fails (client disconnected).
+                    for msg in &rx {
+                        let bytes = msg.as_bytes();
+                        let mut written = 0u32;
+                        if unsafe {
+                            WriteFile(pipe, Some(bytes), Some(&mut written), None)
+                        }
+                        .is_err()
+                        {
+                            tracing::debug!("YASB client disconnected");
+                            break;
+                        }
+                    }
+
+                    // Drain any queued messages before re-creating the pipe.
+                    while rx.try_recv().is_ok() {}
+                    unsafe {
+                        let _ = DisconnectNamedPipe(pipe);
+                        let _ = CloseHandle(pipe);
+                    }
+                }
+            })
+            .is_ok();
+
+        if ok { Some(tx) } else { None }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        drop(rx);
+        None
+    }
+}
+
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct WindowsBackend {
@@ -610,6 +758,9 @@ pub struct WindowsBackend {
     next_id:  u64,
     _hotkeys: HotkeyManager,
     _hooks:   HookGuards,
+    /// Sender end of the channel feeding the YASB named-pipe thread.
+    /// `None` when the pipe could not be created (e.g. insufficient perms).
+    yasb_tx:  Option<std::sync::mpsc::SyncSender<String>>,
 }
 
 impl WindowsBackend {
@@ -664,7 +815,9 @@ impl WindowsBackend {
         let windows = enumerate_windows(&mut next_id);
         tracing::info!(count = windows.len(), "initial window list");
 
-        Ok(Self { windows, next_id, _hotkeys: hotkeys, _hooks: hooks })
+        let yasb_tx = spawn_yasb_pipe();
+
+        Ok(Self { windows, next_id, _hotkeys: hotkeys, _hooks: hooks, yasb_tx })
     }
 }
 
@@ -699,7 +852,13 @@ impl Backend for WindowsBackend {
                 match msg.message {
                     WM_HOTKEY => {
                         let id = HotkeyManager::resolve(msg.wParam.0);
-                        tracing::debug!(?id, "WM_HOTKEY");
+                        tracing::info!(?id, "WM_HOTKEY");
+                        return Ok(Event::Keybinding(id));
+                    }
+
+                    x if x == crate::hotkeys::WM_KBD_HOTKEY => {
+                        let id = HotkeyManager::resolve(msg.wParam.0);
+                        tracing::info!(?id, "keybinding fired (LL hook)");
                         return Ok(Event::Keybinding(id));
                     }
 
@@ -715,6 +874,11 @@ impl Backend for WindowsBackend {
                                 // (SWE_CREATED fires when our SW_HIDE animates away).
                                 if let Some(w) = self.windows.iter_mut().find(|w| w.hwnd == hwnd_val) {
                                     if w.wm_hidden {
+                                        tracing::debug!(
+                                            id = %w.id,
+                                            hwnd = hwnd_val,
+                                            "SWE_CREATED on wm_hidden window — re-hiding"
+                                        );
                                         #[cfg(target_os = "windows")]
                                         unsafe {
                                             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
@@ -722,6 +886,7 @@ impl Backend for WindowsBackend {
                                         }
                                         continue;
                                     }
+                                    tracing::debug!(id = %w.id, hwnd = hwnd_val, "SWE_CREATED already tracked + visible — ignore");
                                     continue; // already tracked and visible — ignore
                                 }
                                 if unsafe { is_manageable(hwnd) } {
@@ -739,7 +904,7 @@ impl Backend for WindowsBackend {
                                 if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val) {
                                     let id = self.windows[pos].id;
                                     self.windows.remove(pos); // Drop runs, destroys overlay
-                                    tracing::debug!(%id, "window destroyed");
+                                    tracing::debug!(%id, hwnd = hwnd_val, "window destroyed");
                                     return Ok(Event::WindowDestroyed(id));
                                 }
                             }
@@ -863,5 +1028,58 @@ impl Backend for WindowsBackend {
 
         #[cfg(not(target_os = "windows"))]
         self.monitor_rect()
+    }
+
+    fn monitor_rects(&self) -> Vec<Rect> {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+            use windows::Win32::Graphics::Gdi::{
+                EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+            };
+
+            unsafe extern "system" fn enum_mon(
+                hmon:   HMONITOR,
+                _hdc:   HDC,
+                _lprect: *mut RECT,
+                lparam: LPARAM,
+            ) -> BOOL {
+                let list = &mut *(lparam.0 as *mut Vec<Rect>);
+                let mut info: MONITORINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                    let r = info.rcWork;
+                    list.push(Rect::new(
+                        r.left,
+                        r.top,
+                        (r.right  - r.left) as u32,
+                        (r.bottom - r.top)  as u32,
+                    ));
+                }
+                BOOL(1)
+            }
+
+            let mut rects: Vec<Rect> = Vec::new();
+            unsafe {
+                let _ = EnumDisplayMonitors(
+                    HDC(std::ptr::null_mut()),
+                    None,
+                    Some(enum_mon),
+                    LPARAM(&mut rects as *mut Vec<Rect> as isize),
+                );
+            }
+            // Sort left-to-right so monitor 0 = leftmost.
+            rects.sort_by_key(|r| r.x);
+            if rects.is_empty() { vec![self.monitor_rect()] } else { rects }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        vec![self.monitor_rect()]
+    }
+
+    fn broadcast_state(&mut self, json: &str) {
+        if let Some(ref tx) = self.yasb_tx {
+            let _ = tx.try_send(json.to_owned());
+        }
     }
 }
