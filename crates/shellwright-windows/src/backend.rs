@@ -45,6 +45,12 @@ const SWE_FOCUSED:          usize = 3;
 const SWE_MOVESIZEEND:      usize = 4;
 const SWE_MINIMIZE_CHANGE:  usize = 5; // MINIMIZESTART or MINIMIZEEND
 const SWE_LOCATIONCHANGE:   usize = 6; // EVENT_OBJECT_LOCATIONCHANGE
+/// Application hid its own window (EVENT_OBJECT_HIDE 0x8003).
+/// We respond by hiding our border overlay so it doesn't float orphaned.
+const SWE_APP_HIDDEN:       usize = 7;
+/// Work area changed — an appbar (e.g. YASB) registered or unregistered.
+/// Posts WM_SETTINGCHANGE 0x001A from `border_wnd_proc` → relayout.
+const SWE_SETTINGS_CHANGED: usize = 8;
 
 // ── Border overlay WndProc ────────────────────────────────────────────────────
 
@@ -63,14 +69,17 @@ unsafe extern "system" fn border_wnd_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::{COLORREF, LRESULT};
+    use windows::Win32::Foundation::{COLORREF, LRESULT, WPARAM, LPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
         HGDIOBJ, PAINTSTRUCT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GetWindowLongPtrW, GWLP_USERDATA, WM_NCHITTEST, WM_PAINT,
+        DefWindowProcW, GetWindowLongPtrW, PostThreadMessageW,
+        GWLP_USERDATA, WM_NCHITTEST, WM_PAINT,
     };
+
+    const WM_SETTINGCHANGE: u32 = 0x001A;
 
     match msg {
         WM_PAINT => {
@@ -85,6 +94,22 @@ unsafe extern "system" fn border_wnd_proc(
         }
         // HTTRANSPARENT = -1: pass all hit-tests through to the window below.
         WM_NCHITTEST => LRESULT(-1),
+        // WM_SETTINGCHANGE is broadcast to all windows when system settings change,
+        // including when an appbar (e.g. YASB) registers/unregisters and updates the
+        // work area via SPI_SETWORKAREA.  Post SWE_SETTINGS_CHANGED to the WM thread
+        // so the event loop can re-query monitor_rects() and relayout.
+        WM_SETTINGCHANGE => {
+            let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
+            if tid != 0 {
+                let _ = PostThreadMessageW(
+                    tid,
+                    WM_SWE,
+                    WPARAM(SWE_SETTINGS_CHANGED),
+                    LPARAM(0),
+                );
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -379,6 +404,50 @@ impl Window for WindowsWindow {
         Ok(())
     }
 
+    fn enter_fullscreen_geometry(&mut self, rect: Rect) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                IsZoomed, SetWindowPos, ShowWindow,
+                HWND_TOPMOST, SW_RESTORE, SWP_NOACTIVATE,
+            };
+            let hwnd = HWND(self.hwnd as *mut _);
+            // Un-maximize first — maximised windows ignore SetWindowPos moves.
+            if IsZoomed(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            // Single atomic call: HWND_TOPMOST (without SWP_NOZORDER) + geometry.
+            // This lands the window at the FRONT of the topmost stack — above YASB
+            // and the taskbar — and positions it to cover the full monitor in one
+            // DWM transaction (no flicker).
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rect.x,
+                rect.y,
+                rect.width  as i32,
+                rect.height as i32,
+                SWP_NOACTIVATE,
+            )
+            .map_err(|e| Error::Backend(format!("SetWindowPos (fullscreen): {e}")))?;
+            self.is_topmost = true;
+            // Keep overlay coords current (it will be hidden by update_borders).
+            if self.overlay_hwnd != 0 {
+                let vr = expand_rect(
+                    visible_rect(HWND(self.hwnd as *mut _), rect),
+                    self.border_width as i32,
+                );
+                position_overlay(
+                    self.overlay_hwnd, self.hwnd, vr,
+                    self.border_width, self.border_radius, true,
+                );
+            }
+        }
+        self.geometry = rect;
+        Ok(())
+    }
+
     fn is_minimized(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
@@ -420,6 +489,55 @@ impl Window for WindowsWindow {
             if self.overlay_hwnd != 0 {
                 let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_SHOWNA);
             }
+        }
+        Ok(())
+    }
+
+    fn park(&mut self) -> Result<()> {
+        tracing::debug!(id = %self.id, hwnd = self.hwnd, "park: moving off-screen (-32000,0)");
+        self.wm_hidden = true;
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, ShowWindow, SW_HIDE,
+                SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            };
+            // Move to a position far off-screen — window stays in the OS/taskbar
+            // but is not visible on any monitor.  SW_HIDE is NOT used so it stays
+            // in the taskbar (global taskbar mode).
+            let _ = SetWindowPos(
+                HWND(self.hwnd as *mut _),
+                HWND(std::ptr::null_mut()),
+                -32000,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+            // Always hide the overlay — it has no useful position off-screen.
+            if self.overlay_hwnd != 0 {
+                let _ = ShowWindow(HWND(self.overlay_hwnd as *mut _), SW_HIDE);
+            }
+        }
+        Ok(())
+    }
+
+    fn raise(&mut self) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            // HWND_TOP brings the window to the top of the non-topmost z-band
+            // without changing its activation state (SWP_NOACTIVATE).
+            let _ = SetWindowPos(
+                HWND(self.hwnd as *mut _),
+                HWND_TOP,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
         Ok(())
     }
@@ -879,7 +997,10 @@ unsafe extern "system" fn win_event_proc(
     let wp: usize = match event {
         0x8002 => SWE_CREATED,          // EVENT_OBJECT_SHOW
         0x8001 => SWE_DESTROYED,        // EVENT_OBJECT_DESTROY
+        0x8003 => SWE_APP_HIDDEN,       // EVENT_OBJECT_HIDE — app hid its own window
         0x0003 => SWE_FOCUSED,          // EVENT_SYSTEM_FOREGROUND
+        0x8005 => SWE_FOCUSED,          // EVENT_OBJECT_FOCUS — catches clicks on windows that
+                                        // are already the OS foreground (no FOREGROUND event fires)
         0x000B => SWE_MOVESIZEEND,      // EVENT_SYSTEM_MOVESIZEEND
         0x0016 | 0x0017 => SWE_MINIMIZE_CHANGE, // EVENT_SYSTEM_MINIMIZESTART / MINIMIZEEND
         0x800B => SWE_LOCATIONCHANGE,   // EVENT_OBJECT_LOCATIONCHANGE
@@ -1040,6 +1161,11 @@ impl WindowsBackend {
                     SetWinEventHook(0x8002, 0x8002, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                     SetWinEventHook(0x8001, 0x8001, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                     SetWinEventHook(0x0003, 0x0003, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
+                    // EVENT_OBJECT_FOCUS: fires when any object gains focus, including top-level
+                    // windows that are already the OS foreground (no FOREGROUND event in that case).
+                    // id_object==0 && id_child==0 filter in win_event_proc keeps only window-level
+                    // focus events; sub-control focus (child HWNDs not in our list) is ignored.
+                    SetWinEventHook(0x8005, 0x8005, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                     SetWinEventHook(0x000B, 0x000B, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                     // Minimize start + minimize end (restore) — both trigger relayout.
                     SetWinEventHook(0x0016, 0x0017, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
@@ -1047,6 +1173,10 @@ impl WindowsBackend {
                     // WINEVENT_SKIPOWNPROCESS (bit 1 of flags) prevents our own SetWindowPos
                     // from triggering this; only external size changes reach us.
                     SetWinEventHook(0x800B, 0x800B, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
+                    // EVENT_OBJECT_HIDE (0x8003) — app hid its own window.
+                    // Used to suppress stale border overlays when a window hides itself
+                    // without going through our hide() path (e.g. system tray apps).
+                    SetWinEventHook(0x8003, 0x8003, HMODULE(std::ptr::null_mut()), Some(win_event_proc), 0, 0, flags).0 as isize,
                 ]
             };
             for &h in &hook_handles {
@@ -1151,7 +1281,19 @@ impl Backend for WindowsBackend {
                             SWE_DESTROYED => {
                                 if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val) {
                                     let id = self.windows[pos].id;
-                                    self.windows.remove(pos); // Drop runs, destroys overlay
+                                    // Explicitly destroy border overlay *before* remove() so we
+                                    // can zero overlay_hwnd and prevent the Drop impl from
+                                    // double-destroying it (belt and suspenders for stale borders).
+                                    if self.windows[pos].overlay_hwnd != 0 {
+                                        let ov = self.windows[pos].overlay_hwnd;
+                                        self.windows[pos].overlay_hwnd = 0;
+                                        unsafe {
+                                            use windows::Win32::Foundation::HWND;
+                                            use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+                                            let _ = DestroyWindow(HWND(ov as *mut _));
+                                        }
+                                    }
+                                    self.windows.remove(pos);
                                     tracing::debug!(%id, hwnd = hwnd_val, "window destroyed");
                                     return Ok(Event::WindowDestroyed(id));
                                 }
@@ -1178,10 +1320,23 @@ impl Backend for WindowsBackend {
 
                             SWE_MOVESIZEEND => {
                                 if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd_val) {
+                                    let old = self.windows[pos].geometry;
                                     unsafe { refresh_geometry(&mut self.windows[pos]); }
-                                    let id = self.windows[pos].id;
-                                    tracing::debug!(%id, "move/resize end");
-                                    return Ok(Event::WindowMoved { id });
+                                    let new = self.windows[pos].geometry;
+                                    let id  = self.windows[pos].id;
+                                    // Distinguish a border-drag resize from a title-bar move:
+                                    // if the window's size changed the user resized it; if only
+                                    // the position changed (size unchanged) it was a drag-move.
+                                    let size_changed =
+                                        new.width  != old.width ||
+                                        new.height != old.height;
+                                    if size_changed {
+                                        tracing::debug!(%id, "user resize end");
+                                        return Ok(Event::WindowResized { id });
+                                    } else {
+                                        tracing::debug!(%id, "move end");
+                                        return Ok(Event::WindowMoved { id });
+                                    }
                                 }
                             }
 
@@ -1222,6 +1377,30 @@ impl Backend for WindowsBackend {
                                         }
                                     }
                                 }
+                            }
+
+                            SWE_APP_HIDDEN => {
+                                // Application hid its own window (not via WM).
+                                // Hide the border overlay so it doesn't float orphaned.
+                                if let Some(w) = self.windows.iter_mut()
+                                    .find(|w| w.hwnd == hwnd_val && !w.wm_hidden)
+                                {
+                                    if w.overlay_hwnd != 0 {
+                                        let ov = w.overlay_hwnd;
+                                        unsafe {
+                                            use windows::Win32::Foundation::HWND;
+                                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                                            let _ = ShowWindow(HWND(ov as *mut _), SW_HIDE);
+                                        }
+                                        tracing::debug!(id = %w.id, "app-hidden: border overlay hidden");
+                                    }
+                                }
+                                continue;
+                            }
+
+                            SWE_SETTINGS_CHANGED => {
+                                tracing::debug!("WM_SETTINGCHANGE received — work area may have changed");
+                                return Ok(Event::WorkAreaChanged);
                             }
 
                             _ => {}

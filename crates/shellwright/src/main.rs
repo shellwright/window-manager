@@ -1,22 +1,59 @@
 //! `shellwright` — cross-platform tiling window manager.
+//!
+//! On Windows the binary is compiled as a GUI subsystem app (`windows_subsystem =
+//! "windows"`) so no console window appears when it starts.  Logs are written to
+//! `%APPDATA%\shellwright\shellwright.log` instead of stdout.
+//!
+//! CLI commands (run before the WM starts):
+//!   `shellwright autostart-register`   — adds a Run registry key so the WM
+//!                                        starts automatically at Windows login.
+//!   `shellwright autostart-unregister` — removes that key.
+
+// Hide the console window on Windows — this is what makes it a background daemon.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use anyhow::Context;
 use shellwright_core::{
     action::Action,
     backend::Backend,
-    config::{Config, Padding},
+    config::{Config, Padding, TaskbarMode},
     event::Event,
     hotkey::BindingMap,
-    layout,
+    layout::{self, LayoutKind},
     window::{Rect, Window, WindowId},
     workspace::Workspace,
 };
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // ── Handle CLI sub-commands before starting the WM ────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(cmd) = args.get(1).map(|s| s.as_str()) {
+        match cmd {
+            "autostart-register" | "--autostart-register" => {
+                autostart_register()?;
+                return Ok(());
+            }
+            "autostart-unregister" | "--autostart-unregister" => {
+                autostart_unregister()?;
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown command: {other}");
+                eprintln!("usage: shellwright [autostart-register|autostart-unregister]");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // ── Normal WM startup ─────────────────────────────────────────────────────
+    let config_dir = resolve_config_dir()?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
+
+    init_tracing(&config_dir.join("shellwright.log"));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting shellwright");
 
-    let config_path = resolve_config_path()?;
+    let config_path = config_dir.join("config.toml");
     let config = if config_path.exists() {
         Config::load(&config_path)
             .with_context(|| format!("failed to load {}", config_path.display()))?
@@ -67,7 +104,7 @@ fn event_loop<B: Backend>(
         .collect();
 
     // Per-monitor workspace assignment.
-    let monitor_rects = backend.monitor_rects();
+    let mut monitor_rects = backend.monitor_rects();
     let n_mons    = monitor_rects.len().max(1);
     let n_ws      = workspaces.len().max(1);
     // Integer div_ceil: (a + b - 1) / b
@@ -120,7 +157,14 @@ fn event_loop<B: Backend>(
 
         match event {
             Event::Quit => {
-                tracing::info!("quit — shutting down");
+                tracing::info!("quit — restoring all hidden windows before shutdown");
+                // Show all WM-hidden windows so they don't become orphaned after exit.
+                let all_ids: Vec<WindowId> = backend.windows().iter().map(|w| w.id()).collect();
+                for id in all_ids {
+                    if let Some(w) = backend.window_mut(id) {
+                        let _ = w.show();
+                    }
+                }
                 break;
             }
 
@@ -132,6 +176,13 @@ fn event_loop<B: Backend>(
                 workspaces[ws_idx].add_window(id);
                 apply_layout(&mut backend, &workspaces[ws_idx], monitor_rects[mon], &config);
                 update_borders(&mut backend, &workspaces[ws_idx], &config);
+                // Monocle: raise the focused window so it stays on top.
+                if workspaces[ws_idx].layout == LayoutKind::Monocle {
+                    if let Some(fid) = workspaces[ws_idx].focused {
+                        if let Some(w) = backend.window_mut(fid) { let _ = w.raise(); }
+                    }
+                }
+                broadcast_yasb(&mut backend, &workspaces, &monitor_ws, ws_per_mon, focused_mon);
             }
 
             Event::WindowDestroyed(id) => {
@@ -144,7 +195,14 @@ fn event_loop<B: Backend>(
                     let ws_idx = monitor_ws[mon];
                     apply_layout(&mut backend, &workspaces[ws_idx], monitor_rects[mon], &config);
                     update_borders(&mut backend, &workspaces[ws_idx], &config);
+                    // Monocle: keep focused window on top after relayout.
+                    if workspaces[ws_idx].layout == LayoutKind::Monocle {
+                        if let Some(fid) = workspaces[ws_idx].focused {
+                            if let Some(w) = backend.window_mut(fid) { let _ = w.raise(); }
+                        }
+                    }
                 }
+                broadcast_yasb(&mut backend, &workspaces, &monitor_ws, ws_per_mon, focused_mon);
             }
 
             Event::WindowFocused(id) => {
@@ -152,8 +210,85 @@ fn event_loop<B: Backend>(
                 if let Some((ws_idx, mon)) =
                     find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
                 {
+                    // Window is already on a visible workspace — just update focus.
                     focused_mon = mon;
                     set_global_focus(id, ws_idx, &mut backend, &mut workspaces, &monitor_ws, &config);
+                    broadcast_yasb(&mut backend, &workspaces, &monitor_ws, ws_per_mon, focused_mon);
+                } else if let Some(ws_idx) = find_any_workspace(&workspaces, id) {
+                    // Window is on a hidden workspace (e.g. taskbar click).
+                    // Switch the owning monitor to that workspace, exactly as SwitchWorkspace does,
+                    // then focus the specific clicked window.
+                    let n_mons = monitor_ws.len();
+                    let mon = (ws_idx / ws_per_mon).min(n_mons - 1);
+                    let current = monitor_ws[mon];
+                    tracing::info!(
+                        %id,
+                        target_ws  = ws_idx,
+                        target_mon = mon,
+                        current_ws = current,
+                        "WindowFocused: switching to hidden workspace for taskbar click"
+                    );
+
+                    let outgoing: Vec<WindowId> = workspaces[current].windows().to_vec();
+                    let animate = config.animations.enabled && backend.system_animations_enabled();
+
+                    monitor_ws[mon] = ws_idx;
+                    focused_mon = mon;
+
+                    let mr = monitor_rects.get(mon).copied().unwrap_or(monitor_rects[0]);
+                    let incoming: Vec<WindowId> = workspaces[ws_idx].windows().to_vec();
+
+                    // Pre-show incoming at alpha=0 for crossfade.
+                    if animate {
+                        for &w_id in &incoming {
+                            if let Some(w) = backend.window_mut(w_id) { let _ = w.set_alpha(0); }
+                        }
+                    }
+                    for &w_id in &incoming {
+                        if let Some(w) = backend.window_mut(w_id) { let _ = w.show(); }
+                    }
+                    apply_layout(&mut backend, &workspaces[ws_idx], mr, &config);
+                    update_borders(&mut backend, &workspaces[ws_idx], &config);
+
+                    // Crossfade outgoing out / incoming in.
+                    if animate {
+                        let frames = config.animations.frames.clamp(1, 60);
+                        let total  = std::time::Duration::from_millis(config.animations.duration_ms as u64);
+                        let start  = std::time::Instant::now();
+                        for frame in 1..=frames {
+                            let t         = frame as f32 / frames as f32;
+                            let alpha_out = ((1.0 - t) * 255.0) as u8;
+                            let alpha_in  = (t * 255.0) as u8;
+                            for &w_id in &outgoing {
+                                if let Some(w) = backend.window_mut(w_id) { let _ = w.set_alpha(alpha_out); }
+                            }
+                            for &w_id in &incoming {
+                                if let Some(w) = backend.window_mut(w_id) { let _ = w.set_alpha(alpha_in); }
+                            }
+                            let frame_target = start + total.mul_f32(t);
+                            let now = std::time::Instant::now();
+                            if frame_target > now { std::thread::sleep(frame_target - now); }
+                        }
+                    }
+                    for &w_id in &outgoing {
+                        if let Some(w) = backend.window_mut(w_id) {
+                            if config.taskbar_mode == TaskbarMode::Global {
+                                let _ = w.park();
+                            } else {
+                                let _ = w.hide();
+                            }
+                        }
+                    }
+                    if animate {
+                        for &w_id in outgoing.iter().chain(incoming.iter()) {
+                            if let Some(w) = backend.window_mut(w_id) { let _ = w.clear_alpha(); }
+                        }
+                    }
+
+                    // Focus the specific window that was clicked.
+                    set_global_focus(id, ws_idx, &mut backend, &mut workspaces, &monitor_ws, &config);
+                    if let Some(w) = backend.window_mut(id) { let _ = w.focus(); }
+                    broadcast_yasb(&mut backend, &workspaces, &monitor_ws, ws_per_mon, focused_mon);
                 }
             }
 
@@ -169,6 +304,18 @@ fn event_loop<B: Backend>(
             Event::WindowSizeChanged { id } => {
                 // External resize (e.g. browser native fullscreen / exit fullscreen).
                 // Re-evaluate borders only — do not re-tile.
+                if let Some((ws_idx, _)) =
+                    find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
+                {
+                    update_borders(&mut backend, &workspaces[ws_idx], &config);
+                }
+            }
+
+            Event::WindowResized { id } => {
+                // User manually resized a tiled window by dragging its border.
+                // Do NOT re-tile — the window keeps its user-defined size until
+                // the next explicit layout operation (new window, workspace switch…).
+                // Only refresh border overlays so they track the new geometry.
                 if let Some((ws_idx, _)) =
                     find_visible_ws_and_mon(&workspaces, &monitor_ws, id)
                 {
@@ -248,6 +395,24 @@ fn event_loop<B: Backend>(
                 }
             }
 
+            Event::WorkAreaChanged => {
+                // An appbar (e.g. YASB) registered or unregistered — re-query work areas
+                // and relayout every monitor's active workspace so windows don't overlap bars.
+                let new_rects = backend.monitor_rects();
+                tracing::info!(
+                    old = ?monitor_rects,
+                    new = ?new_rects,
+                    "WorkAreaChanged: re-querying monitor rects"
+                );
+                monitor_rects = new_rects;
+                for mon in 0..n_mons {
+                    let ws_idx = monitor_ws[mon];
+                    apply_layout(&mut backend, &workspaces[ws_idx], monitor_rects[mon], &config);
+                    update_borders(&mut backend, &workspaces[ws_idx], &config);
+                }
+                broadcast_yasb(&mut backend, &workspaces, &monitor_ws, ws_per_mon, focused_mon);
+            }
+
             Event::Keybinding(kb_id) => {
                 if let Some(action) = bindings.action(kb_id) {
                     tracing::info!(?action, "keybinding fired");
@@ -312,9 +477,8 @@ fn apply_layout<B: Backend>(
     for id in workspace.fullscreen_windows() {
         let rect = backend.monitor_full_rect_for_window(id);
         if let Some(w) = backend.window_mut(id) {
-            let _ = w.set_topmost(true);
-            if let Err(e) = w.set_geometry(rect) {
-                tracing::warn!(%id, err = %e, "set_geometry (fullscreen) failed");
+            if let Err(e) = w.enter_fullscreen_geometry(rect) {
+                tracing::warn!(%id, err = %e, "enter_fullscreen_geometry failed");
             }
         }
     }
@@ -368,11 +532,19 @@ fn set_global_focus<B: Backend>(
     for &ws_idx in monitor_ws {
         update_borders(backend, &workspaces[ws_idx], config);
     }
+    // Monocle: all windows share the same screen rect — raise the focused
+    // window to the top of the non-topmost z-band so it is visible.
+    if workspaces[focused_ws].layout == LayoutKind::Monocle {
+        if let Some(w) = backend.window_mut(id) {
+            let _ = w.raise();
+        }
+    }
 }
 
 fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &Config) {
     let active_color   = parse_hex_color(&config.border_active);
     let inactive_color = parse_hex_color(&config.border_inactive);
+    let is_monocle     = workspace.layout == LayoutKind::Monocle;
 
     for &id in workspace.windows() {
         let is_full      = workspace.is_fullscreen(id);
@@ -391,7 +563,20 @@ fn update_borders<B: Backend>(backend: &mut B, workspace: &Workspace, config: &C
             continue;
         }
 
-        let color = if workspace.focused == Some(id) { active_color } else { inactive_color };
+        // In monocle mode all windows share the same rect stacked in z-order.
+        // Showing a border overlay on a non-focused window would cause the
+        // WS_EX_TOPMOST overlay to appear above the focused window.  Only the
+        // focused window gets a visible border; all others have their overlay
+        // hidden so they don't bleed through.
+        let is_focused = workspace.focused == Some(id);
+        if is_monocle && !is_focused {
+            if let Some(w) = backend.window_mut(id) {
+                let _ = w.hide_border_overlay();
+            }
+            continue;
+        }
+
+        let color = if is_focused { active_color } else { inactive_color };
         if let Some(w) = backend.window_mut(id) {
             let _ = w.set_border_overlay(color, config.border_width, config.border_radius);
             let _ = w.set_border_color(color);
@@ -426,12 +611,18 @@ fn broadcast_yasb<B: Backend>(
     ws_per_mon: usize,
     focused_mon: usize,
 ) {
-    let json = build_yasb_json(workspaces, monitor_ws, ws_per_mon, focused_mon);
+    // Build JSON with an immutable borrow, then broadcast with a mutable one.
+    let json = build_yasb_json(backend as &B, workspaces, monitor_ws, ws_per_mon, focused_mon);
     backend.broadcast_state(&json);
 }
 
-/// Build a komorebi-compatible JSON state line for YASB.
-fn build_yasb_json(
+/// Build the JSON state payload sent to YASB over the named pipe.
+///
+/// Extends the komorebi-compatible monitor/workspace envelope with shellwright-
+/// specific fields: `layout` (current tiling strategy) and `focused_window`
+/// (title of the focused window on each workspace).
+fn build_yasb_json<B: Backend>(
+    backend: &B,
     workspaces: &[Workspace],
     monitor_ws: &[usize],
     ws_per_mon: usize,
@@ -439,6 +630,7 @@ fn build_yasb_json(
 ) -> String {
     let n_mons = monitor_ws.len();
     let n_ws   = workspaces.len();
+    let all_windows = backend.windows();
 
     let mut monitors_json = String::new();
     for mon_idx in 0..n_mons {
@@ -446,9 +638,9 @@ fn build_yasb_json(
             monitors_json.push(',');
         }
 
-        let ws_start    = mon_idx * ws_per_mon;
-        let ws_end      = (ws_start + ws_per_mon).min(n_ws);
-        let active_ws   = monitor_ws[mon_idx];
+        let ws_start      = mon_idx * ws_per_mon;
+        let ws_end        = (ws_start + ws_per_mon).min(n_ws);
+        let active_ws     = monitor_ws[mon_idx];
         let focused_local = if active_ws >= ws_start && active_ws < ws_end {
             active_ws - ws_start
         } else {
@@ -463,15 +655,34 @@ fn build_yasb_json(
             let ws        = &workspaces[ws_idx];
             let local_idx = ws_idx - ws_start;
             let n_windows = ws.windows().len();
+
+            // Window elements — just sequential IDs for compatibility.
             let win_elements: String = (0..n_windows)
                 .map(|i| format!(r#"{{"id":{}}}"#, i))
                 .collect::<Vec<_>>()
                 .join(",");
+
+            // Index of focused window within this workspace's window list.
+            let focused_win_idx = ws.focused
+                .and_then(|fid| ws.windows().iter().position(|&w| w == fid))
+                .unwrap_or(0);
+
+            // Title of the focused window (empty string if none).
+            let focused_title = ws.focused
+                .and_then(|fid| all_windows.iter().find(|w| w.id() == fid))
+                .map(|w| w.title().to_string())
+                .unwrap_or_default();
+
+            let layout_name = layout_kind_str(&ws.layout);
+
             ws_arr.push_str(&format!(
-                r#"{{"name":"{}","index":{},"windows":{{"elements":[{}],"focused":0}}}}"#,
+                r#"{{"name":"{}","index":{},"layout":"{}","focused_window":"{}","windows":{{"elements":[{}],"focused":{}}}}}"#,
                 json_escape(&ws.name),
                 local_idx,
+                layout_name,
+                json_escape(&focused_title),
                 win_elements,
+                focused_win_idx,
             ));
         }
 
@@ -492,6 +703,17 @@ fn build_yasb_json(
             focused_mon,
         )
     )
+}
+
+fn layout_kind_str(kind: &LayoutKind) -> &'static str {
+    match kind {
+        LayoutKind::Fibonacci      => "fibonacci",
+        LayoutKind::Bsp            => "bsp",
+        LayoutKind::Columns { .. } => "columns",
+        LayoutKind::Monocle        => "monocle",
+        LayoutKind::CenterMain     => "center_main",
+        LayoutKind::Float          => "float",
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -555,16 +777,20 @@ fn apply_layout_animated<B: Backend>(
         .map(|(_, s)| inset(s.rect, config.gap))
         .collect();
 
-    const FRAMES: u32 = 10;
-    let sleep_us = (duration_ms as u64 * 1000) / FRAMES as u64;
-    for frame in 1..=FRAMES {
-        let t = ease_out(frame as f32 / FRAMES as f32);
+    let frames   = config.animations.frames.clamp(1, 60);
+    let total    = std::time::Duration::from_millis(duration_ms as u64);
+    let deadline = std::time::Instant::now() + total;
+    let start    = deadline - total;
+    for frame in 1..=frames {
+        let t = ease_out(frame as f32 / frames as f32);
         for (i, &id) in tiled.iter().enumerate() {
             if from_rects[i] == to_rects[i] { continue; }
             let rect = lerp_rect(from_rects[i], to_rects[i], t);
             if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(rect); }
         }
-        std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+        let frame_target = start + total.mul_f32(frame as f32 / frames as f32);
+        let now = std::time::Instant::now();
+        if frame_target > now { std::thread::sleep(frame_target - now); }
     }
     // Snap to exact target positions.
     for (&id, &to) in tiled.iter().zip(to_rects.iter()) {
@@ -573,7 +799,7 @@ fn apply_layout_animated<B: Backend>(
     // Fullscreen windows always snap immediately (use raw monitor bounds).
     for id in workspace.fullscreen_windows() {
         let rect = backend.monitor_full_rect_for_window(id);
-        if let Some(w) = backend.window_mut(id) { let _ = w.set_geometry(rect); }
+        if let Some(w) = backend.window_mut(id) { let _ = w.enter_fullscreen_geometry(rect); }
     }
 }
 
@@ -624,17 +850,21 @@ fn animate_all_targets<B: Backend>(
     backend:     &mut B,
     targets:     &[(WindowId, Rect, Rect)],
     duration_ms: u32,
+    frames:      u32,
 ) {
-    const FRAMES: u32 = 10;
-    let sleep_us = (duration_ms as u64 * 1000) / FRAMES as u64;
-    for frame in 1..=FRAMES {
-        let t = ease_out(frame as f32 / FRAMES as f32);
+    let frames = frames.clamp(1, 60);
+    let total   = std::time::Duration::from_millis(duration_ms as u64);
+    let start   = std::time::Instant::now();
+    for frame in 1..=frames {
+        let t = ease_out(frame as f32 / frames as f32);
         for &(id, from, to) in targets {
             if from == to { continue; }
             let rect = lerp_rect(from, to, t);
             if let Some(win) = backend.window_mut(id) { let _ = win.set_geometry(rect); }
         }
-        std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+        let frame_target = start + total.mul_f32(frame as f32 / frames as f32);
+        let now = std::time::Instant::now();
+        if frame_target > now { std::thread::sleep(frame_target - now); }
     }
     // Snap every window to its exact target.
     for &(id, _, to) in targets {
@@ -754,7 +984,7 @@ fn dispatch<B: Backend>(
                             // accessible, then run one combined loop.
                             let mut targets = compute_layout_targets(backend, &workspaces[cur_ws], src_rect, config);
                             targets.extend(compute_layout_targets(backend, &workspaces[target_ws], tgt_rect, config));
-                            animate_all_targets(backend, &targets, config.animations.duration_ms);
+                            animate_all_targets(backend, &targets, config.animations.duration_ms, config.animations.frames);
                         } else {
                             apply_layout(backend, &workspaces[cur_ws], src_rect, config);
                             apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
@@ -809,7 +1039,7 @@ fn dispatch<B: Backend>(
                         if config.animations.enabled && backend.system_animations_enabled() {
                             let mut targets = compute_layout_targets(backend, &workspaces[cur_ws], src_rect, config);
                             targets.extend(compute_layout_targets(backend, &workspaces[target_ws], tgt_rect, config));
-                            animate_all_targets(backend, &targets, config.animations.duration_ms);
+                            animate_all_targets(backend, &targets, config.animations.duration_ms, config.animations.frames);
                         } else {
                             apply_layout(backend, &workspaces[cur_ws], src_rect, config);
                             apply_layout(backend, &workspaces[target_ws], tgt_rect, config);
@@ -856,6 +1086,8 @@ fn dispatch<B: Backend>(
                     tracing::debug!(%id, floating = now, "toggle float");
                 }
                 apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+                update_borders(backend, &workspaces[cur_ws], config);
+                broadcast_yasb(backend, workspaces, monitor_ws, ws_per_mon, *focused_mon);
             }
         }
 
@@ -871,6 +1103,7 @@ fn dispatch<B: Backend>(
                 fs_rect,
                 config,
             );
+            broadcast_yasb(backend, workspaces, monitor_ws, ws_per_mon, *focused_mon);
         }
 
         // ── Layout ───────────────────────────────────────────────────────────
@@ -878,6 +1111,14 @@ fn dispatch<B: Backend>(
             tracing::info!(?kind, workspace = %workspaces[cur_ws].name, "set layout");
             workspaces[cur_ws].layout = kind;
             apply_layout(backend, &workspaces[cur_ws], cur_mon_rect, config);
+            update_borders(backend, &workspaces[cur_ws], config);
+            // Monocle: raise focused window to top after layout switch.
+            if workspaces[cur_ws].layout == LayoutKind::Monocle {
+                if let Some(fid) = workspaces[cur_ws].focused {
+                    if let Some(w) = backend.window_mut(fid) { let _ = w.raise(); }
+                }
+            }
+            broadcast_yasb(backend, workspaces, monitor_ws, ws_per_mon, *focused_mon);
         }
 
         // ── Workspaces ───────────────────────────────────────────────────────
@@ -949,11 +1190,11 @@ fn dispatch<B: Backend>(
 
             // Crossfade: fade outgoing out and incoming in simultaneously.
             if animate {
-                const FRAMES: u32 = 8;
-                let dur = config.animations.duration_ms;
-                let sleep_us = (dur as u64 * 1000) / FRAMES as u64;
-                for frame in 1..=FRAMES {
-                    let t     = frame as f32 / FRAMES as f32;
+                let frames = config.animations.frames.clamp(1, 60);
+                let total  = std::time::Duration::from_millis(config.animations.duration_ms as u64);
+                let start  = std::time::Instant::now();
+                for frame in 1..=frames {
+                    let t         = frame as f32 / frames as f32;
                     let alpha_out = ((1.0 - t) * 255.0) as u8;
                     let alpha_in  = (t * 255.0) as u8;
                     for &id in &outgoing {
@@ -962,14 +1203,21 @@ fn dispatch<B: Backend>(
                     for &id in &incoming {
                         if let Some(w) = backend.window_mut(id) { let _ = w.set_alpha(alpha_in); }
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                    let frame_target = start + total.mul_f32(t);
+                    let now = std::time::Instant::now();
+                    if frame_target > now { std::thread::sleep(frame_target - now); }
                 }
             }
 
             for &id in &outgoing {
                 if let Some(w) = backend.window_mut(id) {
-                    let res = w.hide();
-                    tracing::debug!(%id, ?res, "hide");
+                    if config.taskbar_mode == TaskbarMode::Global {
+                        let res = w.park();
+                        tracing::debug!(%id, ?res, "park (global taskbar mode)");
+                    } else {
+                        let res = w.hide();
+                        tracing::debug!(%id, ?res, "hide");
+                    }
                 }
             }
             // Clear layered from all: outgoing (hidden, restore for next show) and incoming.
@@ -1037,10 +1285,14 @@ fn dispatch<B: Backend>(
                     apply_layout(backend, &workspaces[target], tgt_mr, config);
                     update_borders(backend, &workspaces[target], config);
                 } else {
-                    // Target workspace is hidden — hide the window before moving.
+                    // Target workspace is hidden — hide (or park) the window before moving.
                     if let Some(w) = backend.window_mut(id) {
-                        let _ = w.hide();
-                        let _ = w.hide_border_overlay();
+                        if config.taskbar_mode == TaskbarMode::Global {
+                            let _ = w.park();
+                        } else {
+                            let _ = w.hide();
+                            let _ = w.hide_border_overlay();
+                        }
                     }
                     workspaces[target].add_window(id);
                     let src_mr = ws_monitor_rect(cur_ws, ws_per_mon, monitor_rects);
@@ -1059,7 +1311,15 @@ fn dispatch<B: Backend>(
         }
 
         Action::Quit => {
-            tracing::info!("quit action");
+            tracing::info!("quit action — restoring all hidden windows before exit");
+            // Show all windows that are hidden (inactive workspaces) so they are not
+            // left as orphaned inaccessible processes after the WM exits.
+            let all_ids: Vec<WindowId> = backend.windows().iter().map(|w| w.id()).collect();
+            for id in all_ids {
+                if let Some(w) = backend.window_mut(id) {
+                    let _ = w.show();
+                }
+            }
             std::process::exit(0);
         }
     }
@@ -1100,26 +1360,35 @@ fn toggle_fullscreen_for<B: Backend>(
         workspace.enter_fullscreen(id, saved);
         tracing::info!(%id, "enter fullscreen");
 
+        // Assert topmost BEFORE animation starts so the window is already above
+        // other topmost windows (e.g. YASB) during the fly-in.
+        if let Some(w) = backend.window_mut(id) {
+            let _ = w.set_topmost(true);
+        }
+
         // Animate from current position to fullscreen rect.
         if config.animations.enabled && backend.system_animations_enabled() {
             let from = backend.window_mut(id).map(|w| w.geometry()).unwrap_or(fullscreen_rect);
             if from != fullscreen_rect {
-                const FRAMES: u32 = 10;
-                let sleep_us = (config.animations.duration_ms as u64 * 1000) / FRAMES as u64;
-                for frame in 1..=FRAMES {
-                    let t    = ease_out(frame as f32 / FRAMES as f32);
+                let frames = config.animations.frames.clamp(1, 60);
+                let total  = std::time::Duration::from_millis(config.animations.duration_ms as u64);
+                let start  = std::time::Instant::now();
+                for frame in 1..=frames {
+                    let t    = ease_out(frame as f32 / frames as f32);
                     let rect = lerp_rect(from, fullscreen_rect, t);
                     if let Some(w) = backend.window_mut(id) { let _ = w.set_geometry(rect); }
-                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                    let frame_target = start + total.mul_f32(frame as f32 / frames as f32);
+                    let now = std::time::Instant::now();
+                    if frame_target > now { std::thread::sleep(frame_target - now); }
                 }
             }
         }
 
-        // Use raw monitor bounds (rcMonitor) — covers taskbar + external bars.
+        // Final snap: atomic TOPMOST + geometry in one DWM call so the window
+        // lands at the front of the topmost stack — above YASB and the taskbar.
         if let Some(w) = backend.window_mut(id) {
-            let _ = w.set_topmost(true);
-            if let Err(e) = w.set_geometry(fullscreen_rect) {
-                tracing::warn!(%id, err = %e, "set_geometry (enter fullscreen) failed");
+            if let Err(e) = w.enter_fullscreen_geometry(fullscreen_rect) {
+                tracing::warn!(%id, err = %e, "enter_fullscreen_geometry failed");
             }
         }
     }
@@ -1155,6 +1424,11 @@ fn find_visible_ws_and_mon(
     None
 }
 
+/// Find the workspace index for a window on *any* workspace (visible or hidden).
+fn find_any_workspace(workspaces: &[Workspace], id: WindowId) -> Option<usize> {
+    workspaces.iter().position(|ws| ws.contains(id))
+}
+
 fn center_of(r: Rect) -> (i32, i32) {
     (r.x + r.width as i32 / 2, r.y + r.height as i32 / 2)
 }
@@ -1165,23 +1439,47 @@ fn dist_sq(a: (i32, i32), b: (i32, i32)) -> i64 {
     dx * dx + dy * dy
 }
 
-fn init_tracing() {
+/// Initialise the tracing subscriber.
+///
+/// On Windows (daemon mode — no console) logs are written to `log_path`.
+/// On other platforms or if the log file cannot be created, logs go to stderr.
+fn init_tracing(log_path: &std::path::Path) {
+    use std::sync::Mutex;
     use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("SHELLWRIGHT_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+
+    let filter = EnvFilter::try_from_env("SHELLWRIGHT_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            fmt()
+                .with_env_filter(filter)
+                .with_writer(Mutex::new(file))
+                .with_ansi(false)
+                .init();
+            return;
+        }
+    }
+
+    // Fallback: stderr (useful on non-Windows or if file open fails).
+    let _ = log_path; // suppress unused-variable warning on non-Windows
+    fmt().with_env_filter(filter).init();
 }
 
-fn resolve_config_path() -> anyhow::Result<std::path::PathBuf> {
+/// Return the per-user shellwright config directory.
+///
+/// Windows: `%APPDATA%\shellwright`
+/// Linux/macOS: `$XDG_CONFIG_HOME/shellwright` (or `~/.config/shellwright`)
+fn resolve_config_dir() -> anyhow::Result<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").context("APPDATA not set")?;
-        Ok(std::path::PathBuf::from(appdata)
-            .join("shellwright")
-            .join("config.toml"))
+        Ok(std::path::PathBuf::from(appdata).join("shellwright"))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1191,6 +1489,68 @@ fn resolve_config_path() -> anyhow::Result<std::path::PathBuf> {
                 let home = std::env::var("HOME").unwrap_or_default();
                 std::path::PathBuf::from(home).join(".config")
             });
-        Ok(base.join("shellwright").join("config.toml"))
+        Ok(base.join("shellwright"))
     }
+}
+
+// ── Autostart (Windows Run registry key) ─────────────────────────────────────
+
+/// Register shellwright to start automatically at Windows login.
+///
+/// Writes `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\shellwright`
+/// pointing to the current executable path.  Uses `reg.exe` (available on all
+/// Windows versions) so no extra crate dependency is needed.
+fn autostart_register() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe().context("cannot determine exe path")?;
+        let exe_str = exe.to_string_lossy();
+        let output = std::process::Command::new("reg")
+            .args([
+                "add",
+                r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                "/v", "shellwright",
+                "/t", "REG_SZ",
+                "/d", exe_str.as_ref(),
+                "/f",
+            ])
+            .output()
+            .context("failed to run reg.exe")?;
+        if output.status.success() {
+            eprintln!("shellwright: autostart registered ({exe_str})");
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("reg add failed: {err}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    eprintln!("autostart-register is a Windows-only command");
+    Ok(())
+}
+
+/// Remove the shellwright autostart registry entry.
+fn autostart_unregister() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("reg")
+            .args([
+                "delete",
+                r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                "/v", "shellwright",
+                "/f",
+            ])
+            .output()
+            .context("failed to run reg.exe")?;
+        if output.status.success() {
+            eprintln!("shellwright: autostart unregistered");
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            // "The system was unable to find the specified registry key or value."
+            // is not a hard error — key simply wasn't there.
+            eprintln!("shellwright: autostart-unregister: {err}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    eprintln!("autostart-unregister is a Windows-only command");
+    Ok(())
 }

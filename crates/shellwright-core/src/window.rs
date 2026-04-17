@@ -87,6 +87,15 @@ pub trait Window: Send + Sync + 'static {
     /// window rendering.
     fn clear_alpha(&mut self) -> Result<()> { Ok(()) }
 
+    /// Park a window off-screen so it stays in the OS taskbar but is not visible.
+    ///
+    /// Used in `TaskbarMode::Global` instead of [`hide`] when switching workspaces.
+    /// Moves the window to `(-32000, 0)` and hides its border overlay.
+    /// The window remains alive for the OS so all instances stay in the taskbar.
+    /// [`show`] + `apply_layout` will reposition it to the correct slot when it
+    /// becomes the active workspace again.
+    fn park(&mut self) -> Result<()> { Ok(()) }
+
     /// Place this window above all non-topmost windows (`true`) or restore
     /// normal z-order (`false`).
     ///
@@ -94,6 +103,29 @@ pub trait Window: Send + Sync + 'static {
     /// Backends implement this via `SetWindowPos(HWND_TOPMOST / HWND_NOTOPMOST)`;
     /// the default is a no-op.
     fn set_topmost(&mut self, _topmost: bool) -> Result<()> { Ok(()) }
+
+    /// Raise the window to the top of the non-topmost z-band without activating it.
+    ///
+    /// Used in monocle mode so the newly-focused window appears above others that
+    /// occupy the same screen rect.  The default is a no-op; Win32 backends
+    /// override with `SetWindowPos(HWND_TOP, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)`.
+    fn raise(&mut self) -> Result<()> { Ok(()) }
+
+    /// Move/resize the window to `rect` **and** assert topmost z-order in a
+    /// single atomic compositor transaction.
+    ///
+    /// Used for fullscreen entry so the window lands above every other topmost
+    /// window — including external bars such as YASB — without a visible
+    /// two-step flicker.
+    ///
+    /// The default implementation calls [`set_topmost`] then [`set_geometry`]
+    /// as two separate calls; platform backends should override this with a
+    /// single combined call (Win32: `SetWindowPos(HWND_TOPMOST, x, y, w, h)`
+    /// without `SWP_NOZORDER`).
+    fn enter_fullscreen_geometry(&mut self, rect: Rect) -> Result<()> {
+        self.set_topmost(true)?;
+        self.set_geometry(rect)
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

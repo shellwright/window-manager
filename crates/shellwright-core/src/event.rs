@@ -18,8 +18,13 @@ pub enum Event {
     WindowDestroyed(WindowId),
     /// A window has been given input focus.
     WindowFocused(WindowId),
-    /// A window was moved or resized by the user (drag / manual resize).
+    /// A window was moved by the user (drag — position changed).
     WindowMoved { id: WindowId },
+    /// A window was resized by the user (border drag — size changed, not position).
+    ///
+    /// Unlike [`WindowMoved`], the tiling layout should NOT be reapplied; the
+    /// window keeps its user-defined size until the next explicit layout operation.
+    WindowResized { id: WindowId },
     /// A window was minimised or restored from minimised state.
     ///
     /// Either transition triggers a full relayout so other tiles can
@@ -36,4 +41,6 @@ pub enum Event {
     Keybinding(KeybindingId),
     /// A clean-shutdown request (signal, IPC command, etc.).
     Quit,
+    /// Monitor work area changed (appbar registered/unregistered, e.g. YASB late-start).
+    WorkAreaChanged,
 }

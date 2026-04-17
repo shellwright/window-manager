@@ -10,6 +10,26 @@ use crate::layout::LayoutKind;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Whether the Windows taskbar shows windows from all workspaces or only the active one.
+///
+/// `Local`  — default; windows on inactive workspaces are hidden via `SW_HIDE`, which removes
+///            them from the taskbar.  Each workspace has its own taskbar population.
+///
+/// `Global` — windows on inactive workspaces are *parked* off-screen at `(-32000, 0)` instead
+///            of hidden.  They remain visible to the OS/taskbar so all instances appear in the
+///            taskbar at all times.  Clicking a parked window's taskbar entry fires
+///            `EVENT_SYSTEM_FOREGROUND`, which the WM intercepts to switch to the correct
+///            workspace and focus that window.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskbarMode {
+    /// Each workspace has its own taskbar entries.
+    Local,
+    /// All windows always appear in the taskbar regardless of workspace (default).
+    #[default]
+    Global,
+}
+
 /// Screen-edge padding in physical pixels.
 ///
 /// Use this to reserve space for external status bars (e.g. YASB) that do not
@@ -32,13 +52,17 @@ pub struct AnimationConfig {
     /// Windows system animation preference.
     pub enabled: bool,
     /// Total animation duration in milliseconds.  Applies to both workspace
-    /// fades and window-move interpolation.
+    /// fades and window-move interpolation.  Lower = faster.
     pub duration_ms: u32,
+    /// Number of interpolation frames per animation.  Fewer frames = snappier
+    /// but choppier; more frames = smoother but heavier.  Each frame sleeps for
+    /// `duration_ms / frames` milliseconds.  Clamped to 1–60.
+    pub frames: u32,
 }
 
 impl Default for AnimationConfig {
     fn default() -> Self {
-        Self { enabled: true, duration_ms: 200 }
+        Self { enabled: true, duration_ms: 80, frames: 6 }
     }
 }
 
@@ -109,6 +133,9 @@ pub struct Config {
     /// (caption present, no resize handle, no maximise button) are floated
     /// without needing a rule here.
     pub float_rules: Vec<FloatRule>,
+    /// Controls whether the Windows taskbar shows windows from all workspaces (`global`)
+    /// or only the currently active workspace (`local`, default).
+    pub taskbar_mode: TaskbarMode,
 }
 
 impl Default for Config {
@@ -125,6 +152,7 @@ impl Default for Config {
             default_layout: LayoutKind::default(),
             animations: AnimationConfig::default(),
             float_rules: Vec::new(),
+            taskbar_mode: TaskbarMode::Global,
         }
     }
 }
@@ -157,6 +185,7 @@ fn default_keybindings() -> Vec<Keybinding> {
         kb(&["alt"], "t", "set_layout:bsp"),
         kb(&["alt"], "m", "set_layout:monocle"),
         kb(&["alt"], "c", "set_layout:columns:2"),
+        kb(&["alt"], "u", "set_layout:center_main"),
         // Workspace switch (Alt+1..9)
         kb(&["alt"], "1", "switch_workspace:1"),
         kb(&["alt"], "2", "switch_workspace:2"),

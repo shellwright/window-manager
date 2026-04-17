@@ -18,6 +18,7 @@
 //! | `"toggle_fullscreen"          | `ToggleFullscreen`                   |
 //! | `"set_layout:bsp"`            | `SetLayout(LayoutKind::Bsp)`         |
 //! | `"set_layout:monocle"`        | `SetLayout(LayoutKind::Monocle)`     |
+//! | `"set_layout:center_main"`    | `SetLayout(LayoutKind::CenterMain)`  |
 //! | `"set_layout:float"`          | `SetLayout(LayoutKind::Float)`       |
 //! | `"set_layout:columns:N"`      | `SetLayout(LayoutKind::Columns{N})`  |
 //! | `"switch_workspace:N"`        | `SwitchWorkspace(N)`                 |
@@ -87,6 +88,7 @@ impl FromStr for Action {
             ["set_layout", "fibonacci"]     => Ok(Action::SetLayout(LayoutKind::Fibonacci)),
             ["set_layout", "bsp"]           => Ok(Action::SetLayout(LayoutKind::Bsp)),
             ["set_layout", "monocle"]       => Ok(Action::SetLayout(LayoutKind::Monocle)),
+            ["set_layout", "center_main"]   => Ok(Action::SetLayout(LayoutKind::CenterMain)),
             ["set_layout", "float"]         => Ok(Action::SetLayout(LayoutKind::Float)),
             ["set_layout", "columns", n]    => {
                 let count = n.parse::<u8>()
