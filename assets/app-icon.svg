@@ -1,0 +1,44 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="windowBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Centered Window -->
+  <rect x="28" y="53" width="200" height="150" rx="14"
+        fill="url(#windowBg)" stroke="#475569" stroke-width="5"/>
+
+  <!-- Title bar divider -->
+  <line x1="28" y1="83" x2="228" y2="83"
+        stroke="#475569" stroke-width="4"/>
+
+  <!-- Title bar dots -->
+  <circle cx="48" cy="69" r="4" fill="#ef4444"/>
+  <circle cx="64" cy="69" r="4" fill="#f59e0b"/>
+  <circle cx="80" cy="69" r="4" fill="#22c55e"/>
+
+  <!-- Terminal prompt -->
+  <path d="M64 119 L84 134 L64 149"
+        fill="none" stroke="url(#accent)" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <rect x="92" y="145" width="30" height="6" rx="3"
+        fill="url(#accent)"/>
+
+  <!-- Craft stroke -->
+  <path d="M120 179 L190 109"
+        stroke="#38bdf8"
+        stroke-width="6"
+        stroke-linecap="round"/>
+
+  <!-- Tool tip -->
+  <circle cx="190" cy="109" r="5" fill="#22c55e"/>
+
+
+</svg>

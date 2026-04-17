@@ -1359,11 +1359,32 @@ impl Backend for WindowsBackend {
                                         let new_w = (r.right  - r.left).unsigned_abs();
                                         let new_h = (r.bottom - r.top).unsigned_abs();
                                         let stored = self.windows[pos].geometry;
-                                        // Emit only when size change is larger than the invisible
-                                        // DWM resize gutter (~8 px); avoids false positives from
-                                        // our own moves or minor DWM adjustments.
                                         let dw = (new_w as i32 - stored.width  as i32).unsigned_abs();
                                         let dh = (new_h as i32 - stored.height as i32).unsigned_abs();
+                                        let dx = (r.left - stored.x).unsigned_abs();
+                                        let dy = (r.top  - stored.y).unsigned_abs();
+
+                                        // Floating window moved: reposition overlay in real-time
+                                        // without emitting an event — no main.rs round-trip needed.
+                                        if self.windows[pos].floating && (dx > 0 || dy > 0 || dw > 0 || dh > 0) {
+                                            let new_rect = Rect::new(r.left, r.top, new_w, new_h);
+                                            self.windows[pos].geometry = new_rect;
+                                            let ov  = self.windows[pos].overlay_hwnd;
+                                            let bw  = self.windows[pos].border_width;
+                                            let br  = self.windows[pos].border_radius;
+                                            let top = self.windows[pos].is_topmost;
+                                            if ov != 0 {
+                                                let vr = expand_rect(
+                                                    unsafe { visible_rect(hwnd, new_rect) },
+                                                    bw as i32,
+                                                );
+                                                unsafe { position_overlay(ov, hwnd_val, vr, bw, br, top); }
+                                            }
+                                            continue;
+                                        }
+
+                                        // Tiled window resized by external agent (snap assist, etc.):
+                                        // emit only when size change exceeds the DWM resize gutter (~8 px).
                                         if dw > 16 || dh > 16 {
                                             self.windows[pos].geometry = Rect::new(
                                                 r.left,

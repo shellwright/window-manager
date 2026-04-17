@@ -1,5 +1,11 @@
+<p align="center">
+    <picture>
+      <source media="(prefers-color-scheme: light)" srcset="./docs/assets/readme/hero-light.png" />
+      <img src="./assets/logo.png" />
+  </picture>
+</p>
 <h1 align="center">
-  Shellwright
+  <span>Shellwright</span>
 </h1>
 
 <p align="center">
@@ -66,10 +72,9 @@ This writes a value to `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` poin
 <summary><strong>First-time setup</strong></summary>
 <br/>
 
-1. Stop komorebi if running: `komorebic stop`
-2. Run `window-manager.exe` — a default config is created automatically at `%APPDATA%\shellwright\config.toml` if one does not exist.
-3. Logs are written to `%APPDATA%\shellwright\shellwright.log`.
-4. If you use YASB, set `[padding]` in your config to match your bar height (see [Configuration](#-configuration)).
+1. Run `window-manager.exe` — a default config is created automatically at `%APPDATA%\shellwright\config.toml` if one does not exist.
+2. Logs are written to `%APPDATA%\shellwright\shellwright.log`.
+3. If you use YASB, set `[padding]` in your config to match your bar height (see [Configuration](#-configuration)).
 
 </details>
 
@@ -81,35 +86,35 @@ Shellwright runs silently in the background and tiles all manageable windows aut
 
 ### Default keybindings
 
-| Keys | Action |
-|------|--------|
-| `Alt + H` | Focus previous window |
-| `Alt + L` | Focus next window |
-| `Alt + Shift + H` | Move window left in layout order |
-| `Alt + Shift + L` | Move window right in layout order |
-| `Alt + Shift + Q` | Close focused window |
-| `Alt + F` | Toggle fullscreen |
-| `Alt + Shift + Space` | Toggle floating / tiled |
-| `Alt + G` | Switch to Fibonacci layout |
-| `Alt + T` | Switch to BSP layout |
-| `Alt + M` | Switch to Monocle layout |
-| `Alt + C` | Switch to Columns (2) layout |
-| `Alt + U` | Switch to CenterMain layout |
-| `Alt + 1 … 9` | Switch to workspace 1–9 |
+| Keys                  | Action                               |
+| --------------------- | ------------------------------------ |
+| `Alt + H`             | Focus previous window                |
+| `Alt + L`             | Focus next window                    |
+| `Alt + Shift + H`     | Move window left in layout order     |
+| `Alt + Shift + L`     | Move window right in layout order    |
+| `Alt + Shift + Q`     | Close focused window                 |
+| `Alt + F`             | Toggle fullscreen                    |
+| `Alt + Shift + Space` | Toggle floating / tiled              |
+| `Alt + G`             | Switch to Fibonacci layout           |
+| `Alt + T`             | Switch to BSP layout                 |
+| `Alt + M`             | Switch to Monocle layout             |
+| `Alt + C`             | Switch to Columns (2) layout         |
+| `Alt + U`             | Switch to CenterMain layout          |
+| `Alt + 1 … 9`         | Switch to workspace 1–9              |
 | `Alt + Shift + 1 … 9` | Move focused window to workspace 1–9 |
-| `Alt + Shift + R` | Reload config |
-| `Alt + Shift + E` | Quit |
+| `Alt + Shift + R`     | Reload config                        |
+| `Alt + Shift + E`     | Quit                                 |
 
 ### Layouts
 
-| Layout | Description |
-|--------|-------------|
-| **Fibonacci** *(default)* | Dwindle spiral — window 0 takes the first half, the rest recurse inward alternating H/V splits |
-| **BSP** | Binary space partition — screen is recursively halved |
-| **Monocle** | All windows stacked full-screen; switching focus raises the top window |
-| **Columns** | Fixed number of equal-width columns (`set_layout:columns:N`) |
-| **CenterMain** | Ultrawide three-column layout — 50% centre, 25% left, 25% right. Ideal for games that can't fill a wide display |
-| **Float** | All windows unmanaged |
+| Layout                    | Description                                                                                                     |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Fibonacci** _(default)_ | Dwindle spiral — window 0 takes the first half, the rest recurse inward alternating H/V splits                  |
+| **BSP**                   | Binary space partition — screen is recursively halved                                                           |
+| **Monocle**               | All windows stacked full-screen; switching focus raises the top window                                          |
+| **Columns**               | Fixed number of equal-width columns (`set_layout:columns:N`)                                                    |
+| **CenterMain**            | Ultrawide three-column layout — 50% centre, 25% left, 25% right. Ideal for games that can't fill a wide display |
+| **Float**                 | All windows unmanaged                                                                                           |
 
 ---
 
@@ -192,23 +197,23 @@ name = "1"
 <summary><strong>All available actions</strong></summary>
 <br/>
 
-| Action string | Effect |
-|---------------|--------|
-| `focus_next` / `focus_prev` | Cycle keyboard focus |
-| `move_next` / `move_prev` | Swap window position in layout order |
-| `kill_focused` | Close focused window gracefully |
-| `toggle_float` | Toggle between tiled and floating |
-| `toggle_fullscreen` | Toggle true fullscreen (covers taskbar) |
-| `set_layout:fibonacci` | Switch active workspace to Fibonacci |
-| `set_layout:bsp` | Switch to BSP |
-| `set_layout:monocle` | Switch to Monocle |
-| `set_layout:columns:N` | Switch to N equal columns |
-| `set_layout:center_main` | Switch to CenterMain |
-| `set_layout:float` | Switch to Float (all windows free) |
-| `switch_workspace:N` | Activate workspace N (1-indexed) |
-| `move_to_workspace:N` | Move focused window to workspace N |
-| `reload_config` | Re-read `config.toml` without restarting |
-| `quit` | Gracefully exit shellwright |
+| Action string               | Effect                                   |
+| --------------------------- | ---------------------------------------- |
+| `focus_next` / `focus_prev` | Cycle keyboard focus                     |
+| `move_next` / `move_prev`   | Swap window position in layout order     |
+| `kill_focused`              | Close focused window gracefully          |
+| `toggle_float`              | Toggle between tiled and floating        |
+| `toggle_fullscreen`         | Toggle true fullscreen (covers taskbar)  |
+| `set_layout:fibonacci`      | Switch active workspace to Fibonacci     |
+| `set_layout:bsp`            | Switch to BSP                            |
+| `set_layout:monocle`        | Switch to Monocle                        |
+| `set_layout:columns:N`      | Switch to N equal columns                |
+| `set_layout:center_main`    | Switch to CenterMain                     |
+| `set_layout:float`          | Switch to Float (all windows free)       |
+| `switch_workspace:N`        | Activate workspace N (1-indexed)         |
+| `move_to_workspace:N`       | Move focused window to workspace N       |
+| `reload_config`             | Re-read `config.toml` without restarting |
+| `quit`                      | Gracefully exit shellwright              |
 
 </details>
 
@@ -216,32 +221,33 @@ name = "1"
 
 ## 📊 Feature Status
 
-| Feature | Status | Platform |
-|---------|--------|----------|
-| Fibonacci / BSP / Monocle / Columns / Float layouts | ✅ Done | All |
-| CenterMain ultrawide layout | ✅ Done | All |
-| Monocle z-order focus raise | ✅ Done | Windows |
-| GDI overlay borders (Win10 + Win11) | ✅ Done | Windows |
-| DWM border colours (Win11 22H2+) | ✅ Done | Windows |
-| Multi-monitor support | ✅ Done | Windows |
-| 9 configurable workspaces | ✅ Done | All |
-| Cross-monitor window movement | ✅ Done | Windows |
-| Drag-to-swap tiled windows | ✅ Done | Windows |
-| Minimized windows excluded from tiling | ✅ Done | Windows |
-| Toggle float / fullscreen | ✅ Done | Windows |
-| Float rules (by class, title, exe) | ✅ Done | Windows |
-| Smooth animations (move + workspace crossfade) | ✅ Done | Windows |
-| TOML config with hot-reload | ✅ Done | All |
-| Global / local taskbar mode | ✅ Done | Windows |
-| YASB named-pipe IPC (workspace indicator) | ✅ Done | Windows |
-| Autostart via registry | ✅ Done | Windows |
-| macOS backend (Accessibility API) | 🚧 In Progress | macOS |
-| Wayland backend (Smithay) | 🚧 In Progress | Linux |
-| Window rules for workspace auto-assignment | 📋 Planned | All |
-| Per-workspace layout persistence across reloads | 📋 Planned | All |
-| Scratchpad windows | 📋 Planned | All |
-| X11 backend | 📋 Planned | Linux |
-| Pre-built release binaries | 📋 Planned | Windows |
+| Feature                                                  | Status         | Platform |
+| -------------------------------------------------------- | -------------- | -------- |
+| Fibonacci / BSP / Columns / CenterMain / Monocle layouts | ✅ Done        | All      |
+| Float Layout                                             | 🚧 In Progress | All      |
+| Monocle z-order focus raise                              | 🚧 In Progress | Windows  |
+| Proper manual window resizing                            | 🚧 In Progress | Windows  |
+| GDI overlay borders (Win10 + Win11)                      | ✅ Done        | Windows  |
+| DWM border colours (Win11 22H2+)                         | ✅ Done        | Windows  |
+| Multi-monitor support                                    | ✅ Done        | Windows  |
+| 9 configurable workspaces                                | ✅ Done        | All      |
+| Cross-monitor window movement                            | ✅ Done        | Windows  |
+| Drag-to-swap tiled windows                               | ✅ Done        | Windows  |
+| Minimized windows excluded from tiling                   | ✅ Done        | Windows  |
+| Toggle float / fullscreen                                | ✅ Done        | Windows  |
+| Float rules (by class, title, exe)                       | ✅ Done        | Windows  |
+| Smooth animations (move + workspace crossfade)           | ✅ Done        | Windows  |
+| TOML config with hot-reload                              | ✅ Done        | All      |
+| Global / local taskbar mode                              | ✅ Done        | Windows  |
+| YASB named-pipe IPC (workspace indicator)                | ✅ Done        | Windows  |
+| Autostart via registry                                   | ✅ Done        | Windows  |
+| macOS backend (Accessibility API)                        | 🚧 In Progress | macOS    |
+| Wayland backend (Smithay)                                | 🚧 In Progress | Linux    |
+| Window rules for workspace auto-assignment               | 📋 Planned     | All      |
+| Per-workspace layout persistence across reloads          | 📋 Planned     | All      |
+| Scratchpad windows                                       | 📋 Planned     | All      |
+| X11 backend                                              | 📋 Planned     | Linux    |
+| Pre-built release binaries                               | 📋 Planned     | Windows  |
 
 ---
 
