@@ -1,140 +1,268 @@
-# shellwright
+<h1 align="center">
+  Shellwright
+</h1>
 
-A Rust tiling window manager for Windows (Win32), designed to be used alongside
-**YASB** status bar and as a drop-in replacement for komorebi.
+<p align="center">
+  A cross-platform tiling window manager written in Rust — automatic, keyboard-driven window tiling with multi-monitor support, smooth animations, and a clean TOML config. Currently targeting Windows, with macOS and Linux (Wayland) backends in progress.
+</p>
 
----
+<h3 align="center">
+  <a href="#-installation">Installation</a>
+  <span> · </span>
+  <a href="#-usage">Usage</a>
+  <span> · </span>
+  <a href="#-configuration">Configuration</a>
+  <span> · </span>
+  <a href="#-feature-status">Feature Status</a>
+  <span> · </span>
+  <a href="#-contributing">Contributing</a>
+</h3>
 
-## What it is
-
-- Automatic tiling of all visible top-level windows
-- **Fibonacci dwindle spiral** layout by default (alternating H/V splits spiralling inward)
-- BSP, Monocle, Columns, Float layouts also available
-- Thick GDI overlay borders — works on Windows 10 and 11 (not DWM-only)
-- Multi-monitor aware: each monitor tiles independently
-- 9 workspaces with Alt+1…9 to switch, Alt+Shift+1…9 to move windows
-- Drag-to-swap: drag a tiled window and it swaps positions with the nearest tile
-- Minimized windows excluded from the tiling count
-- Config file at `%APPDATA%\shellwright\config.toml` (defaults used if absent)
-
----
-
-## Crate layout
-
-```
-crates/
-  shellwright-core/        # Pure logic: layouts, actions, config, workspace, events
-  shellwright-windows/     # Win32 backend (SetWindowPos, SetWinEventHook, GDI overlays)
-  shellwright/             # Binary — event loop, layout dispatch, keybinding dispatch
-```
+<br/>
 
 ---
 
-## Build & run
+## 📋 Installation
+
+Shellwright is built from source. You will need the [Rust toolchain](https://rustup.rs/) (stable, 1.75+).
+
+<details open>
+<summary><strong>Build from source (Windows)</strong></summary>
+<br/>
 
 ```powershell
-# debug build (fast)
-cargo build -p shellwright
+# Clone the repository
+git clone https://github.com/your-username/shellwright
+cd shellwright
 
-# optimised release
-cargo build -p shellwright --release
+# Build optimised release binary
+cargo build --release
 
-# run directly
-cargo run -p shellwright
-
-# or after release build
-.\target\release\shellwright.exe
+# The binary will be at:
+.\target\release\window-manager.exe
 ```
 
-Requires Rust stable + windows-rs 0.58 (no extra system deps).
+</details>
+
+<details>
+<summary><strong>Register as a startup application</strong></summary>
+<br/>
+
+Shellwright can register itself to launch automatically at Windows login using a registry key:
+
+```powershell
+# Register autostart (adds a Run registry entry)
+.\target\release\window-manager.exe autostart-register
+
+# Remove autostart
+.\target\release\window-manager.exe autostart-unregister
+```
+
+This writes a value to `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` pointing to the current exe path. No installer required.
+
+</details>
+
+<details>
+<summary><strong>First-time setup</strong></summary>
+<br/>
+
+1. Stop komorebi if running: `komorebic stop`
+2. Run `window-manager.exe` — a default config is created automatically at `%APPDATA%\shellwright\config.toml` if one does not exist.
+3. Logs are written to `%APPDATA%\shellwright\shellwright.log`.
+4. If you use YASB, set `[padding]` in your config to match your bar height (see [Configuration](#-configuration)).
+
+</details>
 
 ---
 
-## Using with YASB
+## 💻 Usage
 
-1. Disable komorebi (`komorebic stop` or just don't start it).
-2. Start shellwright: `.\shellwright.exe` in a terminal or create a startup task.
-3. YASB runs independently — shellwright does not touch it. Set YASB padding in
-   `config.toml` so tiles don't overlap the bar:
+Shellwright runs silently in the background and tiles all manageable windows automatically as they open and close. No visible UI — everything is driven by keybindings.
 
-```toml
-[padding]
-top = 40   # height of your YASB bar in pixels
-```
-
----
-
-## Default keybindings
+### Default keybindings
 
 | Keys | Action |
-|---|---|
-| Alt+H / Alt+L | Focus prev / next |
-| Alt+Shift+H / Alt+Shift+L | Swap window prev / next in layout |
-| Alt+F | Toggle fullscreen |
-| Alt+Shift+Space | Toggle float |
-| Alt+Shift+Q | Close focused window |
-| Alt+G | Fibonacci layout |
-| Alt+T | BSP layout |
-| Alt+M | Monocle layout |
-| Alt+C | Columns (2) layout |
-| Alt+1…9 | Switch workspace |
-| Alt+Shift+1…9 | Move window to workspace |
-| Alt+Shift+R | Reload config |
-| Alt+Shift+E | Quit |
+|------|--------|
+| `Alt + H` | Focus previous window |
+| `Alt + L` | Focus next window |
+| `Alt + Shift + H` | Move window left in layout order |
+| `Alt + Shift + L` | Move window right in layout order |
+| `Alt + Shift + Q` | Close focused window |
+| `Alt + F` | Toggle fullscreen |
+| `Alt + Shift + Space` | Toggle floating / tiled |
+| `Alt + G` | Switch to Fibonacci layout |
+| `Alt + T` | Switch to BSP layout |
+| `Alt + M` | Switch to Monocle layout |
+| `Alt + C` | Switch to Columns (2) layout |
+| `Alt + U` | Switch to CenterMain layout |
+| `Alt + 1 … 9` | Switch to workspace 1–9 |
+| `Alt + Shift + 1 … 9` | Move focused window to workspace 1–9 |
+| `Alt + Shift + R` | Reload config |
+| `Alt + Shift + E` | Quit |
+
+### Layouts
+
+| Layout | Description |
+|--------|-------------|
+| **Fibonacci** *(default)* | Dwindle spiral — window 0 takes the first half, the rest recurse inward alternating H/V splits |
+| **BSP** | Binary space partition — screen is recursively halved |
+| **Monocle** | All windows stacked full-screen; switching focus raises the top window |
+| **Columns** | Fixed number of equal-width columns (`set_layout:columns:N`) |
+| **CenterMain** | Ultrawide three-column layout — 50% centre, 25% left, 25% right. Ideal for games that can't fill a wide display |
+| **Float** | All windows unmanaged |
 
 ---
 
-## Config reference (`config.toml`)
+## ⚙️ Configuration
+
+Config lives at `%APPDATA%\shellwright\config.toml`. Shellwright creates a default file on first run. Reload changes at any time with `Alt + Shift + R`.
+
+<details open>
+<summary><strong>Full config reference</strong></summary>
+<br/>
 
 ```toml
-gap          = 8          # pixels between tiles
-border_width = 4          # overlay border thickness
-border_active   = "#5E81AC"
-border_inactive = "#3B4252"
+# ── Appearance ─────────────────────────────────────────────────────────────────
+gap           = 8       # pixels between tiled windows
+border_width  = 2       # overlay border thickness in pixels
+border_active   = "#5E81AC"   # border colour for the focused window  (#RRGGBB)
+border_inactive = "#3B4252"   # border colour for all other windows   (#RRGGBB)
+border_radius   = 8           # border corner radius (0 = square)
 
+# ── Taskbar ─────────────────────────────────────────────────────────────────────
+# "global" — windows on inactive workspaces are parked off-screen; they stay
+#            in the taskbar at all times (default).
+# "local"  — windows on inactive workspaces are hidden; each workspace has its
+#            own taskbar entries.
+taskbar_mode = "global"
+
+# ── Default layout ──────────────────────────────────────────────────────────────
+# One of: fibonacci | bsp | monocle | columns | center_main | float
+default_layout = "fibonacci"
+
+# ── YASB / external bar padding ─────────────────────────────────────────────────
+# Shellwright reads the Windows work area (SPI_GETWORKAREA) which respects the
+# OS taskbar but not third-party bars. Set these values to match your bar height
+# so tiles don't slide under it.
 [padding]
-top    = 0
+top    = 40   # e.g. 40 px for a top-aligned YASB bar
 bottom = 0
 left   = 0
 right  = 0
 
+# ── Animations ──────────────────────────────────────────────────────────────────
+[animations]
+enabled     = true
+duration_ms = 80    # total easing time in ms — lower is faster
+frames      = 6     # interpolation steps (1–60) — fewer is snappier
+
+# ── Workspaces ───────────────────────────────────────────────────────────────────
 [[workspaces]]
 name = "1"
-# ... up to 9
+# Repeat up to 9 times. Name appears in YASB workspace widget.
+
+# ── Float rules ──────────────────────────────────────────────────────────────────
+# Windows matching any rule start in floating mode.
+# All specified fields must match (AND logic); omit a field to wildcard it.
+#
+# [[float_rules]]
+# exe   = "steam.exe"
+#
+# [[float_rules]]
+# class = "TaskManagerWindow"
+#
+# [[float_rules]]
+# title_contains = "Properties"
+# exe            = "explorer.exe"
+
+# ── Keybindings ───────────────────────────────────────────────────────────────────
+# Modifiers: "alt", "ctrl", "shift", "super" (Win key)
+# Keys:      a–z, 0–9, f1–f12, return, space, tab, escape, backspace,
+#            up, down, left, right, home, end, pageup, pagedown, and more.
+#
+# [[keybindings]]
+# modifiers = ["alt"]
+# key       = "h"
+# action    = "focus_prev"
 ```
 
+</details>
+
+<details>
+<summary><strong>All available actions</strong></summary>
+<br/>
+
+| Action string | Effect |
+|---------------|--------|
+| `focus_next` / `focus_prev` | Cycle keyboard focus |
+| `move_next` / `move_prev` | Swap window position in layout order |
+| `kill_focused` | Close focused window gracefully |
+| `toggle_float` | Toggle between tiled and floating |
+| `toggle_fullscreen` | Toggle true fullscreen (covers taskbar) |
+| `set_layout:fibonacci` | Switch active workspace to Fibonacci |
+| `set_layout:bsp` | Switch to BSP |
+| `set_layout:monocle` | Switch to Monocle |
+| `set_layout:columns:N` | Switch to N equal columns |
+| `set_layout:center_main` | Switch to CenterMain |
+| `set_layout:float` | Switch to Float (all windows free) |
+| `switch_workspace:N` | Activate workspace N (1-indexed) |
+| `move_to_workspace:N` | Move focused window to workspace N |
+| `reload_config` | Re-read `config.toml` without restarting |
+| `quit` | Gracefully exit shellwright |
+
+</details>
+
 ---
 
-## Current working state
+## 📊 Feature Status
 
-- Tiling, focus cycling, drag-to-swap, fullscreen: **working**
-- GDI overlay borders: **working** (visible on all apps, all Windows versions)
-- Workspace switching (hide/show windows): **working**; per-monitor workspace
-  assignment (workspaces 1-3 → monitor 1 etc.) is **not yet implemented**
-- Minimized windows excluded from tiling: **working**
-- YASB named-pipe IPC (workspace indicator in bar): **not yet implemented**
-- ITaskbarList3 taskbar integration (hide off-workspace windows from taskbar): **not yet implemented**
-- Config hot-reload: **not yet implemented**
+| Feature | Status | Platform |
+|---------|--------|----------|
+| Fibonacci / BSP / Monocle / Columns / Float layouts | ✅ Done | All |
+| CenterMain ultrawide layout | ✅ Done | All |
+| Monocle z-order focus raise | ✅ Done | Windows |
+| GDI overlay borders (Win10 + Win11) | ✅ Done | Windows |
+| DWM border colours (Win11 22H2+) | ✅ Done | Windows |
+| Multi-monitor support | ✅ Done | Windows |
+| 9 configurable workspaces | ✅ Done | All |
+| Cross-monitor window movement | ✅ Done | Windows |
+| Drag-to-swap tiled windows | ✅ Done | Windows |
+| Minimized windows excluded from tiling | ✅ Done | Windows |
+| Toggle float / fullscreen | ✅ Done | Windows |
+| Float rules (by class, title, exe) | ✅ Done | Windows |
+| Smooth animations (move + workspace crossfade) | ✅ Done | Windows |
+| TOML config with hot-reload | ✅ Done | All |
+| Global / local taskbar mode | ✅ Done | Windows |
+| YASB named-pipe IPC (workspace indicator) | ✅ Done | Windows |
+| Autostart via registry | ✅ Done | Windows |
+| macOS backend (Accessibility API) | 🚧 In Progress | macOS |
+| Wayland backend (Smithay) | 🚧 In Progress | Linux |
+| Window rules for workspace auto-assignment | 📋 Planned | All |
+| Per-workspace layout persistence across reloads | 📋 Planned | All |
+| Scratchpad windows | 📋 Planned | All |
+| X11 backend | 📋 Planned | Linux |
+| Pre-built release binaries | 📋 Planned | Windows |
 
 ---
 
-## Continuing development
+## 🤝 Contributing
 
-Key files to read first:
+Shellwright is licensed under the **GNU General Public License v3.0** — you are free to use, modify, and distribute it under the same terms. See [`LICENSE`](LICENSE) for the full text.
 
-- `crates/shellwright-core/src/` — all platform-agnostic logic
-  - `layout.rs` — add new layout algorithms here
-  - `action.rs` — add new keybinding actions here
-  - `config.rs` — default config and keybindings
-  - `workspace.rs` — window grouping logic
-- `crates/shellwright-windows/src/backend.rs` — all Win32 code
-  - `WindowsWindow` struct — per-window state
-  - `border_wnd_proc` + `create_overlay` / `position_overlay` — GDI border system
-  - `next_event` message loop — SWE_CREATED / SWE_DESTROYED / SWE_FOCUSED / SWE_MOVESIZEEND
-- `crates/shellwright/src/main.rs` — event loop + `apply_layout` + `dispatch`
+Contributions of any kind are welcome — bug reports, new layout algorithms, platform backend work, documentation improvements, or just ideas. To get started:
 
-Next priorities (in rough order):
-1. Per-monitor workspace assignment (1-3 → mon1, 4-6 → mon2, 7-9 → mon3)
-2. ITaskbarList3: hide off-workspace windows from taskbar
-3. YASB named pipe IPC: `\\.\pipe\shellwright` with JSON workspace state
-4. Config hot-reload on Alt+Shift+R
+1. Fork the repository and create a feature branch.
+2. The codebase is split into platform-agnostic logic (`shellwright-core`) and platform backends (`shellwright-windows`, `shellwright-macos`, `shellwright-wayland`). New layouts and actions go in `core`; OS-specific code goes in the relevant backend crate.
+3. All public items should have doc comments. Modules include unit tests — please add tests for new logic.
+4. Open a pull request describing what you changed and why.
+
+### Crate layout
+
+```
+crates/
+  shellwright-core/      # Platform-agnostic: layouts, actions, config, workspace, events
+  shellwright-windows/   # Win32 backend — SetWindowPos, SetWinEventHook, GDI overlays
+  shellwright-macos/     # macOS backend — Accessibility API (in progress)
+  shellwright-wayland/   # Wayland backend — Smithay compositor (in progress)
+  shellwright/           # Binary — event loop, layout dispatch, keybinding dispatch
+```
