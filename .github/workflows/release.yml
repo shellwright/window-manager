@@ -1,0 +1,178 @@
+# ── shellwright release workflow ───────────────────────────────────────────────
+#
+# Triggers on:
+#   • push of a version tag  (v0.1.0, v1.2.3, …)
+#   • manual dispatch via the GitHub UI
+#
+# Steps:
+#   1. Build a release binary on windows-latest (GitHub-hosted runner — required
+#      by SignPath to verify build provenance).
+#   2. Upload the unsigned EXE as a GitHub Actions artifact.
+#   3. Submit the artifact to SignPath for Authenticode signing.
+#      SignPath pulls the artifact directly from GitHub, signs it, and returns
+#      the signed copy.
+#   4. Create a GitHub Release and attach the signed EXE.
+#
+# Required repository secrets:
+#   SIGNPATH_API_TOKEN   — REST API token from your SignPath organisation
+#   SIGNPATH_ORG_ID      — Organisation ID shown in the SignPath dashboard
+#
+# SignPath project / policy slugs are hard-coded below; update them to match
+# the values you created in the SignPath dashboard.
+#
+# SignPath OSS programme: https://signpath.io/solutions/open-source-community
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: "Submit to SignPath for signing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # needed to create a GitHub Release
+  id-token: write   # needed by SignPath connector to verify build provenance
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # SignPath project and policy slugs — update to match your SignPath dashboard.
+  SIGNPATH_PROJECT_SLUG: shellwright
+  SIGNPATH_POLICY_SLUG:  release-signing
+
+jobs:
+  # ── 1. Build ────────────────────────────────────────────────────────────────
+  build:
+    name: Build (Windows x86-64)
+    runs-on: windows-latest          # GitHub-hosted runner required by SignPath
+
+    outputs:
+      artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+      version:     ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Resolve version: strip the leading 'v' from the tag, or use the short
+      # commit SHA for workflow_dispatch runs without a tag.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-dev.${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Cargo cache — dramatically reduces build time on repeat runs.
+      - name: Cache Cargo registry and build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc -p shellwright
+
+      # Rename so the artifact has a version suffix.
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/x86_64-pc-windows-msvc/release/window-manager.exe \
+             "staging/shellwright-${{ steps.version.outputs.value }}.exe"
+
+      # Upload the unsigned binary.  SignPath pulls from here.
+      - name: Upload unsigned binary
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellwright-unsigned
+          path: staging/
+          if-no-files-found: error
+          # Retain artifacts for 7 days so the signing job can fetch them.
+          retention-days: 7
+
+  # ── 2. Sign ─────────────────────────────────────────────────────────────────
+  sign:
+    name: Sign with SignPath
+    runs-on: ubuntu-latest           # signing submission only — no Windows needed
+    needs: build
+
+    # Skip signing on workflow_dispatch when the 'sign' input is false.
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sign == true)
+
+    steps:
+      - name: Submit to SignPath
+        id: signpath
+        uses: SignPath/github-action-submit-signing-request@v2
+        with:
+          api-token:             ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id:       ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug:          ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug:   ${{ env.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id:    ${{ needs.build.outputs.artifact-id }}
+          output-artifact-directory: signed/
+          wait-for-completion:   true
+
+      # Re-upload the signed binary as its own artifact so the release job
+      # can download it regardless of which job runs on which runner.
+      - name: Upload signed binary
+        id: upload-signed
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellwright-signed
+          path: signed/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 3. Release ──────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, sign]
+    # Run even if 'sign' was skipped (workflow_dispatch with sign=false).
+    if: always() && needs.build.result == 'success'
+
+    steps:
+      # Prefer the signed artifact; fall back to unsigned if signing was skipped.
+      - name: Download signed binary
+        id: dl-signed
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: shellwright-signed
+          path: release-assets/
+
+      - name: Download unsigned binary (fallback)
+        if: steps.dl-signed.outcome != 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: shellwright-unsigned
+          path: release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: shellwright ${{ needs.build.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: release-assets/**
