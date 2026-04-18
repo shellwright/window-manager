@@ -1486,20 +1486,34 @@ impl Backend for WindowsBackend {
                             }
 
                             SWE_APP_HIDDEN => {
-                                // Application hid its own window (not via WM).
-                                // Hide the border overlay so it doesn't float orphaned.
-                                if let Some(w) = self.windows.iter_mut()
-                                    .find(|w| w.hwnd == hwnd_val && !w.wm_hidden)
+                                // Application hid its own main window (e.g. minimise-to-tray).
+                                // Only react when WE did not hide the window (workspace switch).
+                                //
+                                // Hiding the overlay was not enough — the window stayed in
+                                // self.windows so the layout continued to reserve a tile slot
+                                // for the invisible window (phantom gap).
+                                //
+                                // Fix: remove the window from tracking and synthesise a
+                                // WindowDestroyed event so the event loop retiles immediately.
+                                // If the user later restores the tray app its main window will
+                                // re-appear (EVENT_OBJECT_SHOW → SWE_CREATED) and be re-adopted.
+                                if let Some(pos) = self.windows.iter()
+                                    .position(|w| w.hwnd == hwnd_val && !w.wm_hidden)
                                 {
-                                    if w.overlay_hwnd != 0 {
-                                        let ov = w.overlay_hwnd;
+                                    let id  = self.windows[pos].id;
+                                    let ov  = self.windows[pos].overlay_hwnd;
+                                    // Zero before remove so Drop does not double-destroy.
+                                    self.windows[pos].overlay_hwnd = 0;
+                                    if ov != 0 {
                                         unsafe {
                                             use windows::Win32::Foundation::HWND;
-                                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-                                            let _ = ShowWindow(HWND(ov as *mut _), SW_HIDE);
+                                            use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+                                            let _ = DestroyWindow(HWND(ov as *mut _));
                                         }
-                                        tracing::debug!(id = %w.id, "app-hidden: border overlay hidden");
                                     }
+                                    self.windows.remove(pos);
+                                    self.pending_events.push_back(Event::WindowDestroyed(id));
+                                    tracing::info!(%id, "app-hidden: window removed from WM (tray app)");
                                 }
                                 continue;
                             }
