@@ -236,13 +236,26 @@ unsafe fn position_overlay(overlay: isize, app_hwnd: isize, rect: Rect, border_w
     }
 
     // Ring = outer - inner.  Use rounded rects when radius > 0.
-    let outer = if r > 0 {
-        CreateRoundRectRgn(0, 0, w, h, r * 2, r * 2)
+    //
+    // The overlay is expanded `bw` pixels outward on every side relative to the
+    // visible window edge (see `expand_rect` call in `set_border_overlay`).
+    // To keep the ring a uniform width that hugs the window corners perfectly:
+    //
+    //   outer_r = r + bw   — outer edge is `bw` pixels further out, so its curve
+    //                         must be wider by `bw` to stay parallel to the window corner.
+    //   inner_r = r        — inner edge sits exactly on the visible window boundary,
+    //                         so it must match the window's own DWM corner radius.
+    //
+    // Using r / r-bw (old code) made the inner hole tighter than the window corner,
+    // which left a 1-2 px gap between the ring and the rounded window edge.
+    let outer_r = r + bw;
+    let outer = if outer_r > 0 {
+        CreateRoundRectRgn(0, 0, w, h, outer_r * 2, outer_r * 2)
     } else {
         CreateRectRgn(0, 0, w, h)
     };
-    // Inner radius shrinks by border_width; floor at 0 to avoid negative.
-    let inner_r = (r - bw).max(0);
+    // Inner radius = window's own corner radius (r); floor at 0 for square corners.
+    let inner_r = r.max(0);
     let inner = if inner_r > 0 {
         CreateRoundRectRgn(bw, bw, (w - bw).max(bw + 1), (h - bw).max(bw + 1), inner_r * 2, inner_r * 2)
     } else {
