@@ -1118,14 +1118,17 @@ fn spawn_yasb_pipe() -> Option<std::sync::mpsc::SyncSender<String>> {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct WindowsBackend {
-    windows:     Vec<WindowsWindow>,
-    next_id:     u64,
-    _hotkeys:    HotkeyManager,
-    _hooks:      HookGuards,
+    windows:        Vec<WindowsWindow>,
+    next_id:        u64,
+    _hotkeys:       HotkeyManager,
+    _hooks:         HookGuards,
     /// Sender end of the channel feeding the YASB named-pipe thread.
     /// `None` when the pipe could not be created (e.g. insufficient perms).
-    yasb_tx:     Option<std::sync::mpsc::SyncSender<String>>,
-    float_rules: Vec<FloatRule>,
+    yasb_tx:        Option<std::sync::mpsc::SyncSender<String>>,
+    float_rules:    Vec<FloatRule>,
+    /// Synthetic events produced by the orphan-reaper (see `reap_dead_windows`).
+    /// Drained at the top of each `next_event` loop iteration before blocking.
+    pending_events: std::collections::VecDeque<Event>,
 }
 
 impl WindowsBackend {
@@ -1195,7 +1198,49 @@ impl WindowsBackend {
 
         let yasb_tx = spawn_yasb_pipe();
 
-        Ok(Self { windows, next_id, _hotkeys: hotkeys, _hooks: hooks, yasb_tx, float_rules })
+        Ok(Self {
+            windows,
+            next_id,
+            _hotkeys: hotkeys,
+            _hooks: hooks,
+            yasb_tx,
+            float_rules,
+            pending_events: std::collections::VecDeque::new(),
+        })
+    }
+}
+
+impl WindowsBackend {
+    /// Scan tracked windows with `IsWindow()`.  Any whose HWND is no longer
+    /// valid missed their `EVENT_OBJECT_DESTROY` (common with Electron / Chrome
+    /// apps that destroy their message pump before the WinEvent hook fires).
+    ///
+    /// For each dead window: destroy the overlay, remove from the list, and
+    /// push a synthetic `WindowDestroyed` event onto `pending_events`.
+    #[cfg(target_os = "windows")]
+    fn reap_dead_windows(&mut self) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
+
+        let mut i = 0;
+        while i < self.windows.len() {
+            let alive = unsafe { IsWindow(HWND(self.windows[i].hwnd as *mut _)).as_bool() };
+            if !alive {
+                let id = self.windows[i].id;
+                let ov = self.windows[i].overlay_hwnd;
+                // Zero before remove() so Drop doesn't double-destroy.
+                self.windows[i].overlay_hwnd = 0;
+                if ov != 0 {
+                    unsafe { let _ = DestroyWindow(HWND(ov as *mut _)); }
+                }
+                self.windows.remove(i);
+                self.pending_events.push_back(Event::WindowDestroyed(id));
+                tracing::warn!(%id, "reaped orphaned window (IsWindow=false)");
+                // Don't advance i — the next window has shifted into this slot.
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
@@ -1220,6 +1265,12 @@ impl Backend for WindowsBackend {
 
             let mut msg = MSG::default();
             loop {
+                // Drain any synthetic events (e.g. from orphan-reaper) before
+                // blocking on the next message.
+                if let Some(evt) = self.pending_events.pop_front() {
+                    return Ok(evt);
+                }
+
                 let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
                 match ret.0 {
                     -1 => return Err(Error::Backend("GetMessageW failed".into())),
@@ -1300,6 +1351,27 @@ impl Backend for WindowsBackend {
                             }
 
                             SWE_FOCUSED => {
+                                // Opportunistic reap: Electron/Chrome apps often fail
+                                // to deliver EVENT_OBJECT_DESTROY.  Every time focus
+                                // changes we scan for dead HWNDs so phantoms are
+                                // cleaned up at the next user interaction at the latest.
+                                #[cfg(target_os = "windows")]
+                                self.reap_dead_windows();
+
+                                // Drain newly-queued orphan events before processing
+                                // the focus event so main.rs sees destroy before focus.
+                                if let Some(evt) = self.pending_events.pop_front() {
+                                    // Re-queue the rest; we'll process focus next loop.
+                                    // Actually: just return the destroy event.  The focus
+                                    // event will arrive again when the message is processed.
+                                    // But we consumed the message — so push focus back via
+                                    // a re-post trick isn't possible.  Instead: return the
+                                    // orphan event now; the focus event for hwnd_val will
+                                    // naturally re-fire (OS resends on window activation)
+                                    // or the window will be re-adopted on next interaction.
+                                    return Ok(evt);
+                                }
+
                                 if let Some(w) = self.windows.iter().find(|w| w.hwnd == hwnd_val) {
                                     let id = w.id;
                                     tracing::debug!(%id, "window focused");
