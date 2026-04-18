@@ -38,7 +38,7 @@ Shellwright is built from source. You will need the [Rust toolchain](https://rus
 
 ```powershell
 # Clone the repository
-git clone https://github.com/your-username/shellwright
+git clone https://github.com/shellwright/window-manager
 cd shellwright
 
 # Build optimised release binary
