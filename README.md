@@ -8,6 +8,7 @@
 <br/>
 <br/>
 
+[![Status: Alpha](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/code-lodge/shellwright?style=flat-square)](https://github.com/code-lodge/shellwright/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/code-lodge/shellwright/release.yml?style=flat-square&label=build)](https://github.com/code-lodge/shellwright/actions/workflows/release.yml)
@@ -20,6 +21,9 @@
 [Website](https://code-lodge.github.io/shellwright) · [Download](#-quick-start) · [Configuration](#%EF%B8%8F-configuration) · [Contributing](#-contributing)
 
 </div>
+
+> [!WARNING]
+> Shellwright is **alpha software** and is not ready for production use. Core features work, but you should expect breaking changes between releases, missing functionality, and rough edges. Use at your own risk.
 
 ---
 

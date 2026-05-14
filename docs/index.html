@@ -39,10 +39,54 @@
       overflow-x: hidden;
     }
 
+    /* ── ALPHA BANNER ───────────────────────────────────────────── */
+    .alpha-banner {
+      position: sticky;
+      top: 0;
+      z-index: 101;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 9px 1.5rem;
+      background: rgba(234, 88, 12, 0.12);
+      border-bottom: 1px solid rgba(234, 88, 12, 0.3);
+      backdrop-filter: blur(12px);
+      font-size: 13px;
+      line-height: 1.4;
+      text-align: center;
+    }
+
+    .alpha-banner-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 9px;
+      background: rgba(234, 88, 12, 0.2);
+      border: 1px solid rgba(234, 88, 12, 0.4);
+      border-radius: 99px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      color: #fb923c;
+      flex-shrink: 0;
+    }
+
+    .alpha-banner-text {
+      color: #fdba74;
+    }
+
+    .alpha-banner-text a {
+      color: #fb923c;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    .alpha-banner-text a:hover { color: #fff; }
+
     /* ── NAV ─────────────────────────────────────────────────────── */
     nav {
       position: sticky;
-      top: 0;
+      top: 37px;
       z-index: 100;
       display: flex;
       align-items: center;
@@ -771,6 +815,12 @@
 </head>
 <body>
 
+<!-- ── ALPHA BANNER ─────────────────────────────────────────────── -->
+<div class="alpha-banner">
+  <span class="alpha-banner-pill">ALPHA</span>
+  <span class="alpha-banner-text">Shellwright is early-stage software — not production ready. Expect breaking changes and missing features. <a href="https://github.com/code-lodge/shellwright/issues" target="_blank" rel="noopener noreferrer">Report issues on GitHub.</a></span>
+</div>
+
 <!-- ── NAV ────────────────────────────────────────────────────────── -->
 <nav>
   <a href="#" class="nav-logo">
@@ -813,7 +863,7 @@
 
 <!-- ── HERO ────────────────────────────────────────────────────────── -->
 <section class="hero">
-  <span class="badge">OPEN SOURCE &nbsp;·&nbsp; GPL-3.0</span>
+  <span class="badge" style="border-color: rgba(234,88,12,0.35); color: #fb923c; background: rgba(234,88,12,0.08);">⚠&nbsp; ALPHA &nbsp;·&nbsp; NOT PRODUCTION READY</span>
   <h1>Tile every window.<br><span class="gradient">Automatically.</span></h1>
   <p class="subtitle">Shellwright runs silently in the background and tiles all your windows as they open — no setup, no dragging. Pure keyboard control, smooth animations, and a clean TOML config.</p>
   <div class="hero-ctas">
